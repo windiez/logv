@@ -70,7 +70,7 @@ public:
         return (h - t) & MASK;
     }
 
-    bool empty() const noexcept {
+    [[nodiscard]] bool empty() const noexcept {
         return head_.load(std::memory_order_acquire) ==
                tail_.load(std::memory_order_acquire);
     }
