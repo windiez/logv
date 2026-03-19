@@ -323,7 +323,8 @@ const LVL_FG = { WARNING:'#856404', ERROR:'#721c24', CRITICAL:'#4a235a',
                  DEBUG:'#555555', INFO:'#222222', '':'#222222' };
 function rowColors(r) { return { bg: LVL_BG[r.lvl] || svcBg(r.svc), fg: LVL_FG[r.lvl] || '#222222' }; }
 function tsDisplay(ts) { const d = ts.indexOf('.'); return d >= 0 ? ts.substring(0, d) : ts; }
-function esc(s) { return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+const _ESC = {'&':'&amp;','<':'&lt;','>':'&gt;'};
+function esc(s) { return String(s??'').replace(/[&<>]/g, c => _ESC[c]); }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // State
