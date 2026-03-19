@@ -47,7 +47,8 @@ public:
     }
 
     /// Drain up to `max` items into `out` vector. Returns count drained.
-    /// Amortises the atomic load cost — the inner loop is a tight copy.
+    /// Amortises the atomic load cost -- the inner loop is a tight copy.
+    /// head/tail are logical monotone counters; MASK applied at store.
     template<typename Vec>
     std::size_t pop_many(Vec& out, std::size_t max) {
         const std::size_t h = head_.load(std::memory_order_acquire);
@@ -55,11 +56,11 @@ public:
         std::size_t count = 0;
         while (count < max && t != h) {
             out.push_back(std::move(buf_[t]));
-            t = (t + 1) & MASK;
+            ++t;
             ++count;
         }
         if (count)
-            tail_.store(t, std::memory_order_release);
+            tail_.store(t & MASK, std::memory_order_release);
         return count;
     }
 
