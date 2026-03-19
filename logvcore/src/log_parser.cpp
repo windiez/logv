@@ -4,6 +4,9 @@
 
 namespace logvcore {
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 namespace {
 
 void copy_str(char* dst, std::size_t dst_size, const char* src, std::size_t len) {
