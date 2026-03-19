@@ -15,6 +15,7 @@ std::string to_lower(const std::string& s) {
 }
 
 // Find index of name in a fixed registry; returns 64 (invalid) if not found.
+// Linear scan is fine: registry size is bounded (max 65 entries).
 uint8_t find_index(const std::string* names, int count, const char* name) {
     for (int i = 0; i < count; ++i)
         if (names[i] == name) return static_cast<uint8_t>(i);
