@@ -356,13 +356,13 @@ std::string service_bg_hex(const std::string& service) {
         h *= 16777619u;
     }
 
-    // Keep colors light/pastel.
-    const int r = 210 + static_cast<int>((h >> 0) & 0x1f);
-    const int g = 210 + static_cast<int>((h >> 8) & 0x1f);
+    // Keep colors light/pastel; use more hash bits for better per-service spread.
+    const int r = 210 + static_cast<int>((h >>  0) & 0xff);
+    const int g = 210 + static_cast<int>((h >>  8) & 0x1f);
     const int b = 210 + static_cast<int>((h >> 16) & 0x1f);
 
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", r, g, b);
+    char buf[8];  // "#rrggbb\0" = 8 bytes
+    std::sprintf(buf, "#%02x%02x%02x", r, g, b);
     return std::string(buf);
 }
 
@@ -611,7 +611,7 @@ int month_index(const char* mon3) {
 }
 
 uint64_t timestamp_order_key(const logvcore::LogEntry& e) {
-    char mon[4]{};
+    char mon[3]{};   // 3-char month abbreviation — "Jan".."Dec"
     int day = 0;
     int hh = 0;
     int mm = 0;
