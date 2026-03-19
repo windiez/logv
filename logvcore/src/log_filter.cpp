@@ -27,7 +27,7 @@ void LogFilter::set_services(const std::vector<std::string>& names) {
     svc_count_ = 0;
     svc_mask_ = 0;
     for (auto& n : names) {
-        if (svc_count_ >= 64) break;
+        if (svc_count_ >= 65) break;
         svc_names_[svc_count_] = n;
         svc_mask_ |= (uint64_t{1} << svc_count_);
         ++svc_count_;
@@ -39,7 +39,7 @@ void LogFilter::set_levels(const std::vector<std::string>& names) {
     lvl_count_ = 0;
     lvl_mask_ = 0;
     for (auto& n : names) {
-        if (lvl_count_ >= 64) break;
+        if (lvl_count_ >= 65) break;
         lvl_names_[lvl_count_] = n;
         lvl_mask_ |= (uint64_t{1} << lvl_count_);
         ++lvl_count_;
@@ -55,14 +55,14 @@ bool LogFilter::accepts(const LogEntry& e) const noexcept {
     // Service check
     if (svc_count_ > 0) {
         uint8_t idx = find_index(svc_names_, svc_count_, e.service);
-        if (idx >= 64 || !((svc_mask_ >> idx) & 1))
+        if (idx > 64 || !((svc_mask_ >> idx) & 1))
             return false;
     }
 
     // Level check
     if (lvl_count_ > 0) {
         uint8_t idx = find_index(lvl_names_, lvl_count_, e.level);
-        if (idx >= 64 || !((lvl_mask_ >> idx) & 1))
+        if (idx > 64 || !((lvl_mask_ >> idx) & 1))
             return false;
     }
 
