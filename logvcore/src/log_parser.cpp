@@ -7,7 +7,8 @@ namespace logvcore {
 namespace {
 
 void copy_str(char* dst, std::size_t dst_size, const char* src, std::size_t len) {
-    std::size_t n = len < dst_size - 1 ? len : dst_size - 1;
+    // Clamp to buffer size so we never read past `src + len`.
+    std::size_t n = len < dst_size ? len : dst_size;
     std::memcpy(dst, src, n);
     dst[n] = '\0';
 }
