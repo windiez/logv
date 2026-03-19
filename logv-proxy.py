@@ -161,12 +161,16 @@ def _ws_handshake(conn):
             headers[k.lower()] = v.strip()
     key = headers.get("sec-websocket-key", "")
     accept = _b64encode(_sha1((key + _WS_MAGIC).encode()))
+    # Echo the browser UA back so embedded-device logs can show which client
+    # connected (useful when no reverse-DNS is available on the LAN).
+    ua = headers.get("user-agent", "")
     conn.sendall((
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: {}\r\n\r\n"
-    ).format(accept).encode())
+        "Sec-WebSocket-Accept: {}\r\n"
+        "X-Client: {}\r\n\r\n"
+    ).format(accept, ua).encode())
     return True
 
 
