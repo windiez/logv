@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logv &mdash; Log Viewer</title>
+<style>
+/* ── Reset / base ──────────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:system-ui,-apple-system,'Segoe UI',Ubuntu,'DejaVu Sans',sans-serif;
+     font-size:13px;background:#f6f5f4;color:#2e2e2e;display:flex;flex-direction:column}
+
+/* ── Toolbar ───────────────────────────────────────────────────────────────── */
+#toolbar{display:flex;align-items:center;gap:5px;padding:5px 8px;
+  background:#e8e8e8;border-bottom:1px solid #c8c8c8;flex-shrink:0;flex-wrap:wrap}
+#app-title{font-weight:bold;font-size:14px;color:#222;margin-right:4px}
+button{padding:4px 11px;background:linear-gradient(to bottom,#f6f6f6,#e0e0e0);
+  border:1px solid #b0b0b0;border-radius:4px;cursor:pointer;font-size:13px;
+  color:#2e2e2e;white-space:nowrap}
+button:hover{background:linear-gradient(to bottom,#efefef,#d4d4d4)}
+button:active{background:linear-gradient(to bottom,#d4d4d4,#c4c4c4)}
+button:disabled{opacity:.5;cursor:default}
+button.primary{background:linear-gradient(to bottom,#4a90d9,#3584e4);color:#fff;
+  border-color:#1a6fc4}
+button.primary:hover{background:linear-gradient(to bottom,#5a9fe8,#4592ed)}
+button.danger{background:linear-gradient(to bottom,#e87070,#d94040);color:#fff;
+  border-color:#b03030}
+label.chk-lbl{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+input[type="checkbox"]{width:14px;height:14px;cursor:pointer;accent-color:#3584e4}
+
+/* ── Filter bar ────────────────────────────────────────────────────────────── */
+#filterbar{display:flex;align-items:center;gap:6px;padding:4px 8px;
+  background:#f0efee;border-bottom:1px solid #c8c8c8;flex-shrink:0;flex-wrap:wrap}
+.txt-input{padding:3px 7px;border:1px solid #b0b0b0;border-radius:4px;
+  font-size:13px;background:#fff;color:#2e2e2e}
+.txt-input:focus{outline:2px solid #3584e4;outline-offset:-1px;border-color:#3584e4}
+#filter-text{min-width:220px;flex:1}
+#btn-clear-excl{background:#c01c28;color:#fff;border:none;border-radius:4px;
+  padding:3px 9px;font-size:12px;cursor:pointer;display:none}
+#btn-clear-excl:hover{background:#a51d2d}
+
+/* ── Services dropdown ─────────────────────────────────────────────────────── */
+.dropdown{position:relative}
+.dropdown-menu{position:absolute;top:calc(100% + 3px);left:0;background:#fff;
+  border:1px solid #b0b0b0;border-radius:5px;box-shadow:0 4px 14px rgba(0,0,0,.18);
+  z-index:200;max-height:340px;overflow-y:auto;min-width:240px;
+  padding:4px 0;display:none}
+.dropdown-menu.open{display:block}
+.svc-item{display:flex;align-items:center;gap:8px;padding:4px 12px;cursor:pointer;user-select:none}
+.svc-item:hover{background:#e8f0fe}
+
+/* ── Column header ─────────────────────────────────────────────────────────── */
+#col-header{display:flex;background:#e0dedd;border-bottom:2px solid #b4b4b4;
+  flex-shrink:0;overflow:hidden}
+.col-hdr{padding:4px 7px;font-weight:bold;font-size:12px;border-right:1px solid #c4c4c4;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center}
+.col-hdr-sortable{cursor:pointer;user-select:none}
+.col-hdr-sortable:hover{background:#d0cfce}
+.sort-arrow{margin-left:5px;font-size:10px;opacity:0.8}
+
+/* ── Virtual scroll table ──────────────────────────────────────────────────── */
+#table-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+#scroll-container{flex:1;overflow-y:scroll;overflow-x:auto;position:relative;background:#fff}
+#virtual-space{position:relative}
+#rows-viewport{position:absolute;left:0;right:0;top:0}
+.log-row{display:flex;border-bottom:1px solid rgba(0,0,0,.055);cursor:default;user-select:none}
+.log-row:hover{filter:brightness(.95)}
+.log-row.selected{outline:2px inset rgba(53,132,228,.75);filter:brightness(.82)}
+.log-cell{padding:2px 7px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+  border-right:1px solid rgba(0,0,0,.07);line-height:18px;display:flex;align-items:center;font-size:13px}
+
+/* ── Column widths ─────────────────────────────────────────────────────────── */
+.col-ts {width:152px;flex-shrink:0}
+.col-svc{width:230px;flex-shrink:0}
+.col-lvl{width:80px; flex-shrink:0}
+.col-msg{flex:1;min-width:200px}
+
+/* ── Status bar ────────────────────────────────────────────────────────────── */
+#statusbar{display:flex;justify-content:space-between;align-items:center;padding:3px 10px;
+  background:#e0dedd;border-top:1px solid #c8c8c8;font-size:12px;color:#555;flex-shrink:0}
+
+/* ── Drop zone overlay ─────────────────────────────────────────────────────── */
+#dropzone{display:none;position:fixed;inset:0;background:rgba(53,132,228,.12);
+  border:3px dashed #3584e4;z-index:300;align-items:center;justify-content:center;
+  font-size:22px;font-weight:bold;color:#1a5fb4;pointer-events:none}
+#dropzone.active{display:flex}
+
+/* ── Dialogs ───────────────────────────────────────────────────────────────── */
+dialog{border:1px solid #b0b0b0;border-radius:6px;padding:0;
+  box-shadow:0 8px 28px rgba(0,0,0,.25);font-family:inherit;font-size:13px;min-width:460px}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+.dlg-header{padding:12px 16px 8px;font-weight:bold;font-size:14px;
+  border-bottom:1px solid #e0e0e0;background:#f6f5f4}
+.dlg-body{padding:14px 16px}
+.dlg-footer{display:flex;justify-content:flex-end;gap:8px;padding:10px 16px;
+  border-top:1px solid #e0e0e0;background:#f6f5f4}
+.form-row{display:grid;grid-template-columns:170px 1fr;align-items:center;gap:6px;margin-bottom:8px}
+.form-row label{text-align:right;color:#444}
+
+/* ── Context menu ──────────────────────────────────────────────────────────── */
+.ctx-menu{position:fixed;background:#fff;border:1px solid #b0b0b0;border-radius:5px;
+  box-shadow:0 4px 14px rgba(0,0,0,.2);z-index:500;padding:3px 0;min-width:120px}
+.ctx-item{padding:6px 20px;cursor:pointer;font-size:13px}
+.ctx-item:hover{background:#3584e4;color:#fff}
+
+/* ── Spinner ───────────────────────────────────────────────────────────────── */
+#loading{display:none;position:fixed;inset:0;background:rgba(0,0,0,.28);z-index:400;
+  align-items:center;justify-content:center}
+#loading.active{display:flex}
+.spinner{background:#fff;border-radius:8px;padding:22px 34px;font-size:15px;color:#333;
+  box-shadow:0 4px 20px rgba(0,0,0,.3)}
+</style>
+</head>
+<body>
+
+<div id="dropzone">&#128229; Drop log file here</div>
+<div id="loading"><div class="spinner">&#x23F3; Parsing&hellip;</div></div>
+
+<!--  ── Toolbar ── -->
+<div id="toolbar">
+  <span id="app-title">logv</span>
+  <label>Host:</label>
+  <input id="inp-host" class="txt-input" type="text" placeholder="192.168.130.81"
+         style="width:160px" onkeydown="if(event.key==='Enter')toggleConnect()">
+  <input id="inp-port" class="txt-input" type="number" placeholder="9222"
+         style="width:70px" min="1" max="65535" value="9222">
+  <button id="btn-connect" class="primary" onclick="toggleConnect()">Connect</button>
+  <button onclick="clearAll()">Clear</button>
+  <button onclick="openSettings()">Settings</button>
+  <label class="chk-lbl"><input type="checkbox" id="chk-autoscroll" checked> Auto-scroll</label>
+  <span style="flex:1"></span>
+  <button onclick="document.getElementById('fi').click()" title="Open log file">&#128194; Open File</button>
+  <input type="file" id="fi" style="display:none" accept=".log,.txt,*"
+         onchange="if(this.files[0])loadFile(this.files[0]);this.value=''">
+  <button onclick="showPaste()" title="Paste log text">&#128203; Paste</button>
+</div>
+
+<!--  ── Filter bar ── -->
+<div id="filterbar">
+  <div class="dropdown">
+    <button id="svc-btn" onclick="toggleSvcMenu(event)">Services: All</button>
+    <div id="svc-menu" class="dropdown-menu"></div>
+  </div>
+  <span>Text:</span>
+  <input id="filter-text" class="txt-input" type="text"
+         placeholder="Filter by service / message" oninput="scheduleFilter()">
+  <span>Level:</span>
+  <select id="filter-level" class="txt-input" onchange="scheduleFilter()">
+    <option value="">All levels</option>
+    <option>DEBUG</option><option>INFO</option><option>WARNING</option>
+    <option>ERROR</option><option>CRITICAL</option>
+  </select>
+  <button id="btn-clear-excl" onclick="clearExclusions()" title="Remove all exclusions">&#10005; Clear exclusions</button>
+  <button id="btn-reset-filters" onclick="resetAllFilters()" title="Reset all active filters" style="display:none;background:#e66100;color:#fff;border:none;border-radius:4px;padding:3px 9px;font-size:12px;cursor:pointer">&#10005; Reset filters</button>
+</div>
+
+<!--  ── Column header ── -->
+<div id="table-wrap">
+  <div id="col-header">
+    <div class="col-hdr col-ts col-hdr-sortable" onclick="toggleSort()" title="Click to toggle sort order">Timestamp <span id="sort-arrow" class="sort-arrow">&#9650;</span></div>
+    <div class="col-hdr col-svc">Service</div>
+    <div class="col-hdr col-lvl">Level</div>
+    <div class="col-hdr col-msg">Message</div>
+  </div>
+  <div id="scroll-container">
+    <div id="virtual-space">
+      <div id="rows-viewport"></div>
+    </div>
+  </div>
+</div>
+
+<!--  ── Status bar ── -->
+<div id="statusbar">
+  <span id="status-l">Disconnected &mdash; enter a host IP and click Connect</span>
+  <span id="status-r">0 lines</span>
+</div>
+
+<!--  ── Settings dialog ── -->
+<dialog id="dlg-settings">
+  <div class="dlg-header">Settings</div>
+  <div class="dlg-body">
+    <div class="form-row">
+      <label>Remote command:</label>
+      <input id="cfg-cmd" class="txt-input" type="text" style="width:100%">
+    </div>
+    <div class="form-row">
+      <label>Proxy port:</label>
+      <input id="cfg-port" class="txt-input" type="number" min="1" max="65535" style="width:90px">
+    </div>
+    <div class="form-row">
+      <label>Max log lines (0=&infin;):</label>
+      <input id="cfg-maxlines" class="txt-input" type="number" min="0" style="width:100px">
+    </div>
+    <div class="form-row">
+      <label></label>
+      <label class="chk-lbl">
+        <input type="checkbox" id="cfg-reconnect"> Auto-reconnect on disconnect
+      </label>
+    </div>
+  </div>
+  <div class="dlg-footer">
+    <button onclick="document.getElementById('dlg-settings').close()">Cancel</button>
+    <button class="primary" onclick="saveSettings()">Save</button>
+  </div>
+</dialog>
+
+<script>
+'use strict';
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Config — persisted to localStorage
+// ══════════════════════════════════════════════════════════════════════════════
+const DEFAULT_CMD = 'journalctl -f --no-pager -o short-precise 2>&1 | cat';
+
+const cfg = {
+  host:          '',
+  port:          9222,
+  cmd:           DEFAULT_CMD,
+  autoReconnect: true,
+  maxLines:      50000,
+};
+
+function loadCfg() {
+  try {
+    const s = JSON.parse(localStorage.getItem('logv-cfg') || '{}');
+    if (s.host)          { cfg.host = s.host; document.getElementById('inp-host').value = s.host; }
+    if (s.port)          { cfg.port = s.port; document.getElementById('inp-port').value = s.port; }
+    if (s.cmd)           cfg.cmd = s.cmd;
+    if (s.maxLines >= 0) cfg.maxLines = s.maxLines;
+    if (s.autoReconnect != null) cfg.autoReconnect = s.autoReconnect;
+    // restore filters
+    if (s.textFilter) { const el = document.getElementById('filter-text'); el.value = s.textFilter; }
+    if (s.levelFilter) { const el = document.getElementById('filter-level'); el.value = s.levelFilter; }
+    if (s.svcFilter)    pendingSvcFilter = s.svcFilter;   // applied after checkboxes are created
+    if (s.autoscroll != null)
+      document.getElementById('chk-autoscroll').checked = s.autoscroll;
+    updateFilterIndicators();  // highlight any active filters restored from storage
+  } catch(_) {}
+}
+
+function persistCfg() {
+  try {
+    localStorage.setItem('logv-cfg', JSON.stringify({
+      host:          cfg.host,
+      port:          cfg.port,
+      cmd:           cfg.cmd,
+      maxLines:      cfg.maxLines,
+      autoReconnect: cfg.autoReconnect,
+      textFilter:    document.getElementById('filter-text').value,
+      levelFilter:   document.getElementById('filter-level').value,
+      svcFilter:     Object.entries(svcState).filter(([,v])=>v).map(([k])=>k),
+      autoscroll:    document.getElementById('chk-autoscroll').checked,
+    }));
+  } catch(_) {}
+}
+
+let pendingSvcFilter = null;  // loaded from cfg before checkboxes exist
+
+// ══════════════════════════════════════════════════════════════════════════════
+// JS log-line parser  (mirrors logvcore/src/log_parser.cpp)
+// ══════════════════════════════════════════════════════════════════════════════
+function parseLineJS(raw) {
+  const e = { ts:'', svc:'', lvl:'', msg:'', raw };
+  if (!raw || raw[0] < 'A' || raw[0] > 'Z') { e.msg = raw.trimEnd(); return e; }
+  let p = 0; const n = raw.length;
+  // timestamp
+  p = 3;
+  while (p < n && raw[p] === ' ') p++;
+  if (p >= n || !/\d/.test(raw[p])) { e.msg = raw.trimEnd(); return e; }
+  while (p < n && /\d/.test(raw[p])) p++;
+  if (p >= n || raw[p] !== ' ')      { e.msg = raw.trimEnd(); return e; }
+  p++;
+  if (p >= n || !/\d/.test(raw[p])) { e.msg = raw.trimEnd(); return e; }
+  while (p < n && /[\d:.]/.test(raw[p])) p++;
+  e.ts = raw.substring(0, p);
+  // hostname
+  if (p >= n || raw[p] !== ' ') return e; p++;
+  while (p < n && raw[p] !== ' ') p++;
+  if (p >= n) return e; p++;
+  // service[PID]:
+  const ss = p;
+  while (p < n && raw[p] !== '[' && raw[p] !== ':' && raw[p] !== ' ') p++;
+  const svcRaw = raw.substring(ss, p);
+  const dot = svcRaw.indexOf('.');
+  e.svc = dot >= 0 ? svcRaw.substring(0, dot) : svcRaw;
+  if (p < n && raw[p] === '[') { while (p < n && raw[p] !== ']') p++; if (p < n) p++; }
+  if (p < n && raw[p] === ':') p++;
+  if (p < n && raw[p] === ' ') p++;
+  // <N> kernel prefix
+  if (p < n && raw[p] === '<') { while (p < n && raw[p] !== '>') p++; if (p < n) p++; }
+  // [LEVEL]
+  if (p >= n || raw[p] !== '[') { e.msg = raw.substring(p).trimEnd(); return e; }
+  p++;
+  const ls = p;
+  while (p < n && raw[p] !== ']') p++;
+  const lvl = raw.substring(ls, p);
+  if (p < n) p++;
+  const LEVELS = new Set(['DEBUG','INFO','WARNING','WARN','ERROR','CRITICAL']);
+  if (!LEVELS.has(lvl)) { e.msg = raw.substring(p).trimEnd(); return e; }
+  e.lvl = (lvl === 'WARN') ? 'WARNING' : lvl;
+  // (tid=N)
+  if (p < n && raw[p] === '(') { while (p < n && raw[p] !== ')') p++; if (p < n) p++; }
+  while (p < n && raw[p] === ' ') p++;
+  e.msg = raw.substring(p).trimEnd();
+  return e;
+}
+
+// Active parser — upgraded to WASM when Module loads
+let activeParseLine = parseLineJS;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Color helpers
+// ══════════════════════════════════════════════════════════════════════════════
+function svcBg(svc) {
+  if (!svc) return '#ffffff';
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < svc.length; i++) { h ^= svc.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return `rgb(${210+(h&0x1f)},${210+((h>>>8)&0x1f)},${210+((h>>>16)&0x1f)})`;
+}
+const LVL_BG = { WARNING:'#fff3cd', ERROR:'#f8d7da', CRITICAL:'#e2b4ff' };
+const LVL_FG = { WARNING:'#856404', ERROR:'#721c24', CRITICAL:'#4a235a',
+                 DEBUG:'#555555', INFO:'#222222', '':'#222222' };
+function rowColors(r) { return { bg: LVL_BG[r.lvl] || svcBg(r.svc), fg: LVL_FG[r.lvl] || '#222222' }; }
+function tsDisplay(ts) { const d = ts.indexOf('.'); return d >= 0 ? ts.substring(0, d) : ts; }
+function esc(s) { return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// State
+// ══════════════════════════════════════════════════════════════════════════════
+const ROW_H  = 22;
+const BUFFER = 40;
+
+let allRows      = [];
+let filteredRows = [];
+let excludedMsgs = new Set();   // exact msg strings excluded by user
+let selected     = new Set();
+let svcState     = {};    // { svcName: checked }
+let lastClick    = -1;
+let pending      = [];    // incoming WS lines, drained every 100 ms
+let filterTimer  = null;
+let sortDir      = 1;     // 1 = ascending (oldest first), -1 = descending (newest first)
+
+function toggleSort() {
+  sortDir = -sortDir;
+  document.getElementById('sort-arrow').innerHTML = sortDir === 1 ? '&#9650;' : '&#9660;';
+  applyFilters();
+  if (document.getElementById('chk-autoscroll').checked) scrollLatest();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Virtual scroll
+// ══════════════════════════════════════════════════════════════════════════════
+const scrollEl  = document.getElementById('scroll-container');
+const vspace    = document.getElementById('virtual-space');
+const viewport  = document.getElementById('rows-viewport');
+
+function renderRows() {
+  const totalH = filteredRows.length * ROW_H;
+  vspace.style.height = totalH + 'px';
+  const viewH  = scrollEl.clientHeight;
+  const top    = scrollEl.scrollTop;
+  const si     = Math.max(0, Math.floor(top / ROW_H) - BUFFER);
+  const ei     = Math.min(filteredRows.length, Math.ceil((top + viewH) / ROW_H) + BUFFER);
+  viewport.style.top = (si * ROW_H) + 'px';
+  const frag = document.createDocumentFragment();
+  for (let i = si; i < ei; i++) {
+    const row = filteredRows[i];
+    const {bg, fg} = rowColors(row);
+    const div = document.createElement('div');
+    div.className = 'log-row' + (selected.has(i) ? ' selected' : '');
+    div.style.cssText = `background:${bg};color:${fg};height:${ROW_H}px`;
+    div.dataset.i = i;
+    const ts = esc(tsDisplay(row.ts)), svc = esc(row.svc),
+          lvl = esc(row.lvl), msg = esc(row.msg);
+    div.innerHTML =
+      `<div class="log-cell col-ts"  title="${ts}">${ts}</div>` +
+      `<div class="log-cell col-svc" title="${svc}">${svc}</div>` +
+      `<div class="log-cell col-lvl" title="${lvl}">${lvl}</div>` +
+      `<div class="log-cell col-msg" title="${msg}">${msg}</div>`;
+    frag.appendChild(div);
+  }
+  viewport.textContent = '';
+  viewport.appendChild(frag);
+}
+
+scrollEl.addEventListener('scroll', renderRows);
+window.addEventListener('resize', renderRows);
+function scrollBottom() { scrollEl.scrollTop = scrollEl.scrollHeight; }
+function scrollLatest() {
+  if (sortDir === -1) scrollEl.scrollTop = 0;   // descending: newest at top
+  else scrollBottom();                           // ascending:  newest at bottom
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Selection
+// ══════════════════════════════════════════════════════════════════════════════
+viewport.addEventListener('mousedown', e => {
+  const rowEl = e.target.closest('.log-row');
+  if (!rowEl) return;
+  const idx = +rowEl.dataset.i;
+  if (e.shiftKey && lastClick >= 0) {
+    const lo = Math.min(idx, lastClick), hi = Math.max(idx, lastClick);
+    if (!e.ctrlKey && !e.metaKey) selected.clear();
+    for (let i = lo; i <= hi; i++) selected.add(i);
+  } else if (e.ctrlKey || e.metaKey) {
+    selected.has(idx) ? selected.delete(idx) : selected.add(idx);
+    lastClick = idx;
+  } else {
+    selected.clear(); selected.add(idx); lastClick = idx;
+  }
+  renderRows();
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Copy  (Ctrl+C + right-click context menu)
+// ══════════════════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selected.size > 0) {
+    copySelected(); e.preventDefault();
+  }
+});
+
+viewport.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (selected.size === 0) return;
+  document.getElementById('_ctx')?.remove();
+  const m = document.createElement('div');
+  m.className = 'ctx-menu'; m.id = '_ctx';
+  m.style.left = e.clientX + 'px'; m.style.top = e.clientY + 'px';
+
+  const itCopy = document.createElement('div');
+  itCopy.className = 'ctx-item'; itCopy.textContent = 'Copy';
+  itCopy.onclick = () => { copySelected(); m.remove(); };
+  m.appendChild(itCopy);
+
+  const itExcl = document.createElement('div');
+  itExcl.className = 'ctx-item'; itExcl.textContent = 'Exclude selected';
+  itExcl.onclick = () => { excludeSelected(); m.remove(); };
+  m.appendChild(itExcl);
+
+  document.body.appendChild(m);
+  setTimeout(() => document.addEventListener('click', () => m.remove(), { once: true }), 0);
+});
+
+function copySelected() {
+  const txt = [...selected].sort((a,b)=>a-b)
+    .map(i => { const r = filteredRows[i]; return [r.ts,r.svc,r.lvl,r.msg].join('\t'); })
+    .join('\n');
+  navigator.clipboard.writeText(txt).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = txt; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  });
+}
+
+function excludeSelected() {
+  [...selected].forEach(i => {
+    const r = filteredRows[i];
+    if (r && r.msg) excludedMsgs.add(r.msg);
+  });
+  selected.clear();
+  document.getElementById('btn-clear-excl').style.display =
+    excludedMsgs.size > 0 ? 'inline-block' : 'none';
+  applyFilters();
+}
+
+function clearExclusions() {
+  excludedMsgs.clear();
+  document.getElementById('btn-clear-excl').style.display = 'none';
+  applyFilters();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Services dropdown
+// ══════════════════════════════════════════════════════════════════════════════
+function toggleSvcMenu(e) {
+  e.stopPropagation();
+  document.getElementById('svc-menu').classList.toggle('open');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.dropdown'))
+    document.getElementById('svc-menu').classList.remove('open');
+});
+
+function ensureSvc(svc) {
+  if (svcState.hasOwnProperty(svc)) return;
+  // Determine initial checked state from saved filter
+  let checked = true;
+  if (pendingSvcFilter) checked = pendingSvcFilter.includes(svc);
+  svcState[svc] = checked;
+  const menu = document.getElementById('svc-menu');
+  const lbl = document.createElement('label'); lbl.className = 'svc-item';
+  const chk = document.createElement('input'); chk.type='checkbox'; chk.checked = checked;
+  chk.addEventListener('change', () => { svcState[svc] = chk.checked; updateSvcBtn(); scheduleFilter(); });
+  lbl.appendChild(chk);
+  lbl.appendChild(document.createTextNode(' ' + svc));
+  menu.appendChild(lbl);
+  updateSvcBtn();
+}
+
+function updateSvcBtn() {
+  const total = Object.keys(svcState).length;
+  const on = Object.values(svcState).filter(Boolean).length;
+  document.getElementById('svc-btn').textContent =
+    (total === 0 || on === total) ? 'Services: All' : `Services: ${on}/${total}`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Filtering
+// ══════════════════════════════════════════════════════════════════════════════
+function scheduleFilter() {
+  clearTimeout(filterTimer);
+  selected.clear();   // user changed a filter -- selection no longer valid
+  filterTimer = setTimeout(applyFilters, 80);
+  updateFilterIndicators();
+}
+
+function updateFilterIndicators() {
+  const level = document.getElementById('filter-level').value;
+  const text  = document.getElementById('filter-text').value;
+  const levelEl = document.getElementById('filter-level');
+  levelEl.style.background = level ? '#fff3cd' : '';
+  levelEl.style.fontWeight = level ? 'bold'   : '';
+  const anyActive = level || text || excludedMsgs.size > 0;
+  document.getElementById('btn-reset-filters').style.display = anyActive ? 'inline-block' : 'none';
+}
+
+function resetAllFilters() {
+  document.getElementById('filter-level').value = '';
+  document.getElementById('filter-text').value  = '';
+  excludedMsgs.clear();
+  document.getElementById('btn-clear-excl').style.display = 'none';
+  updateFilterIndicators();
+  applyFilters();
+}
+
+function applyFilters() {
+  const text  = document.getElementById('filter-text').value.toLowerCase();
+  const level = document.getElementById('filter-level').value;
+  const hasSvc = Object.keys(svcState).length > 0;
+  filteredRows = allRows.filter(r => {
+    if (excludedMsgs.size > 0 && excludedMsgs.has(r.msg)) return false;
+    if (hasSvc && svcState.hasOwnProperty(r.svc) && !svcState[r.svc]) return false;
+    if (level && r.lvl !== level) return false;
+    if (text && !(r.svc.toLowerCase().includes(text) || r.msg.toLowerCase().includes(text))) return false;
+    return true;
+  });
+  if (sortDir === -1) filteredRows = filteredRows.slice().reverse();
+  document.getElementById('status-r').textContent = filteredRows.length.toLocaleString() + ' lines';
+  renderRows();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Ingest lines (parses + adds to allRows, discovers services)
+// ══════════════════════════════════════════════════════════════════════════════
+function ingestLines(lines) {
+  let changed = false;
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line) continue;
+    if (cfg.maxLines > 0 && allRows.length >= cfg.maxLines) allRows.shift();
+    let r;
+    try { r = activeParseLine(line); } catch(_) { r = null; }
+    if (!r) r = { ts:'', svc:'', lvl:'', msg:line, raw:line };
+    if (!r.lvl) r.lvl = '';
+    allRows.push(r);
+    if (r.svc) ensureSvc(r.svc);
+    changed = true;
+  }
+  return changed;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Drain timer — 100 ms interval, same pattern as GTK drain_pending
+// ══════════════════════════════════════════════════════════════════════════════
+setInterval(() => {
+  if (pending.length === 0) return;
+  const batch = pending.splice(0, 2000);
+  if (!ingestLines(batch)) return;
+  applyFilters();
+  const autoScroll = document.getElementById('chk-autoscroll').checked;
+  if (autoScroll) {
+    scrollLatest();
+  } else if (selected.size > 0) {
+    // User is reading/selecting -- don't disturb the viewport.
+    // applyFilters() already updated filteredRows and the line count;
+    // just update the virtual space height so the scrollbar stays correct.
+    vspace.style.height = (filteredRows.length * ROW_H) + 'px';
+    return;
+  }
+}, 100);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WebSocket connection
+// ══════════════════════════════════════════════════════════════════════════════
+let ws              = null;
+let manualDisconn   = false;
+let reconnectTimer  = null;
+let lastHost        = '';
+
+function toggleConnect() {
+  if (ws) { manualDisconn = true; disconnect(); }
+  else connect();
+}
+
+function connect() {
+  cfg.host = document.getElementById('inp-host').value.trim();
+  cfg.port = parseInt(document.getElementById('inp-port').value) || 9222;
+  if (!cfg.host) { setStatus('Enter a host IP address'); return; }
+
+  // If host changed, clear discovered services
+  if (cfg.host !== lastHost && lastHost !== '') {
+    const menu = document.getElementById('svc-menu');
+    menu.innerHTML = '';
+    svcState = {};
+    updateSvcBtn();
+  }
+  lastHost = cfg.host;
+
+  clearTimeout(reconnectTimer);
+  manualDisconn = false;
+
+  const url = `ws://${cfg.host}:${cfg.port}`;
+  setStatus(`Connecting to ${url}\u2026`);
+  setBtnConn(false);
+
+  try { ws = new WebSocket(url); }
+  catch(e) { setStatus(`Invalid address: ${e.message}`); return; }
+
+  ws.onopen = () => {
+    setStatus(`Connected \u2014 streaming from ${cfg.host}`);
+    setBtnConn(true);
+    ws.send(JSON.stringify({ cmd: cfg.cmd }));
+    persistCfg();
+  };
+  ws.onmessage = e => pending.push(e.data);
+  ws.onclose = () => {
+    ws = null; setBtnConn(false);
+    if (!manualDisconn && cfg.autoReconnect) {
+      setStatus('Connection lost \u2014 reconnecting in 5s\u2026');
+      reconnectTimer = setTimeout(connect, 5000);
+    } else {
+      setStatus('Disconnected');
+    }
+  };
+  ws.onerror = () => {
+    setStatus(`\u26a0\ufe0f Cannot reach ${cfg.host}:${cfg.port} \u2014 is logv-proxy.py running on the device?`);
+  };
+}
+
+function disconnect() {
+  clearTimeout(reconnectTimer);
+  ws?.close(); ws = null;
+  setBtnConn(false);
+  setStatus('Disconnected');
+}
+
+function setStatus(msg) { document.getElementById('status-l').textContent = msg; }
+
+function setBtnConn(connected) {
+  const btn = document.getElementById('btn-connect');
+  btn.textContent   = connected ? 'Disconnect' : 'Connect';
+  btn.className     = connected ? 'danger'     : 'primary';
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Clear
+// ══════════════════════════════════════════════════════════════════════════════
+function clearAll() {
+  allRows = []; filteredRows = []; selected.clear(); pending = [];
+  document.getElementById('status-r').textContent = '0 lines';
+  renderRows();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Settings dialog
+// ══════════════════════════════════════════════════════════════════════════════
+function openSettings() {
+  document.getElementById('cfg-cmd').value      = cfg.cmd;
+  document.getElementById('cfg-port').value     = cfg.port;
+  document.getElementById('cfg-maxlines').value = cfg.maxLines;
+  document.getElementById('cfg-reconnect').checked = cfg.autoReconnect;
+  document.getElementById('dlg-settings').showModal();
+}
+
+function saveSettings() {
+  cfg.cmd           = document.getElementById('cfg-cmd').value.trim() || DEFAULT_CMD;
+  cfg.port          = parseInt(document.getElementById('cfg-port').value) || 9222;
+  cfg.maxLines      = parseInt(document.getElementById('cfg-maxlines').value) || 0;
+  cfg.autoReconnect = document.getElementById('cfg-reconnect').checked;
+  document.getElementById('inp-port').value = cfg.port;
+  document.getElementById('dlg-settings').close();
+  persistCfg();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// File loading + paste
+// ══════════════════════════════════════════════════════════════════════════════
+function loadFile(f) {
+  const load = document.getElementById('loading'); load.classList.add('active');
+  const reader = new FileReader();
+  reader.onload = ev => setTimeout(() => {
+    ingestLines(ev.target.result.split('\n'));
+    applyFilters();
+    setStatus(`${f.name} \u2014 ${allRows.length.toLocaleString()} lines`);
+    load.classList.remove('active');
+  }, 0);
+  reader.readAsText(f);
+}
+
+async function showPaste() {
+  try {
+    const txt = await navigator.clipboard.readText();
+    if (txt) { _ingestText(txt, 'Clipboard'); return; }
+  } catch(_) {}
+  const dlg = document.createElement('dialog');
+  dlg.innerHTML = `<div class="dlg-header">Paste Log Text</div>
+    <div class="dlg-body">
+      <textarea id="_pta" style="width:580px;height:220px;font-family:monospace;font-size:12px;
+        border:1px solid #b0b0b0;border-radius:4px;padding:6px;display:block"
+        placeholder="Paste journalctl output here\u2026"></textarea>
+    </div>
+    <div class="dlg-footer">
+      <button onclick="this.closest('dialog').close();this.closest('dialog').remove()">Cancel</button>
+      <button class="primary" onclick="_doPaste(this)">OK</button>
+    </div>`;
+  document.body.appendChild(dlg); dlg.showModal();
+  dlg.querySelector('#_pta').focus();
+}
+function _doPaste(btn) {
+  const dlg = btn.closest('dialog'), txt = dlg.querySelector('#_pta').value;
+  dlg.close(); dlg.remove();
+  if (txt) _ingestText(txt, 'Pasted text');
+}
+function _ingestText(txt, label) {
+  const load = document.getElementById('loading'); load.classList.add('active');
+  setTimeout(() => {
+    ingestLines(txt.split('\n'));
+    applyFilters();
+    setStatus(`${label} \u2014 ${allRows.length.toLocaleString()} lines`);
+    load.classList.remove('active');
+  }, 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Drag & drop
+// ══════════════════════════════════════════════════════════════════════════════
+document.addEventListener('dragover', e => {
+  e.preventDefault(); document.getElementById('dropzone').classList.add('active');
+});
+document.addEventListener('dragleave', e => {
+  if (!e.relatedTarget) document.getElementById('dropzone').classList.remove('active');
+});
+document.addEventListener('drop', e => {
+  e.preventDefault(); document.getElementById('dropzone').classList.remove('active');
+  const f = e.dataTransfer.files[0]; if (f) loadFile(f);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Init
+// ══════════════════════════════════════════════════════════════════════════════
+loadCfg();
+
+// Override host/port from query string (?host=192.168.1.1&port=9222).
+// run_wasm.sh passes these so the viewer auto-fills on open.
+(function() {
+  const p = new URLSearchParams(location.search);
+  const h = p.get('host'), po = p.get('port');
+  if (h)  { cfg.host = h;         document.getElementById('inp-host').value = h; }
+  if (po) { cfg.port = parseInt(po)||9222; document.getElementById('inp-port').value = cfg.port; }
+})();
+
+// WASM module -- must be declared before the emscripten script runs
+var Module = {
+  onRuntimeInitialized: function() {
+    activeParseLine = line => Module.parseLine(line);
+  }
+};
+</script>
+
+{{{ SCRIPT }}}
+
+</body>
+</html>

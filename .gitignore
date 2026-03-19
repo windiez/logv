@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+
+# C++ build artifacts
+logvcore/build/
+logvcore/build-windows/
+logvcore/obj/
+_logvcore*.so
+*.dll
+gtk_native/build/
+__pycache__/
+*.pyc
+wasm/dist/
+emsdk/
