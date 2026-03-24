@@ -20,6 +20,9 @@
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -42,6 +45,33 @@ enum Column {
 
 constexpr const char* kLegacyRemoteCmd = "journalctl -f --no-pager 2>&1 | cat";
 constexpr const char* kDefaultRemoteCmd = "journalctl -f --no-pager -o short-precise 2>&1 | cat";
+constexpr const char* kLocalTargetKey = "__local__";
+
+enum class ConnectionMode {
+    Auto,
+    Ssh,
+    Local
+};
+
+enum class SshProbe {
+    KeyOk,
+    AuthRequired,
+    Failed
+};
+
+struct CommandResult {
+    int exit_code{127};
+    std::string output;
+};
+
+struct LaunchPlan {
+    bool ok{false};
+    bool uses_ssh{false};
+    std::string target_key;
+    std::string shell_cmd;
+    std::string status_text;
+    std::string error_text;
+};
 
 struct UiState {
     GtkWidget* window{};
@@ -55,6 +85,8 @@ struct UiState {
     GtkWidget* autoscroll_check{};
     GtkWidget* status_label{};
     GtkWidget* count_label{};
+    GtkWidget* settings_btn{};
+    GtkWidget* check_svc_btn{};
     GtkWidget* tree_view{};
     GtkWidget* scroll{};
     GtkTreeViewColumn* ts_column{};
@@ -74,6 +106,9 @@ struct UiState {
     std::unordered_map<std::string, GtkWidget*> service_checks;
     bool newest_at_bottom{true};
     std::atomic<bool> reconnecting{false};
+    std::atomic<bool> shutting_down{false};
+    std::atomic<bool> auto_reconnect_runtime{true};
+    std::atomic<bool> svc_check_running{false};
     guint reconnect_timer_id{0};
 
     struct AppConfig {
@@ -99,8 +134,10 @@ struct UiState {
         std::string last_text_filter{};
         bool auto_scroll{true};
         bool newest_at_bottom{true};
+        std::string connection_mode{"auto"};
         std::string ssh_host{"192.168.130.81"};
         std::string ssh_username{"root"};
+        std::string ssh_password{};  // session-only; never persisted to disk
         std::string ssh_command{kDefaultRemoteCmd};
         int ssh_port{22};
         int ssh_keepalive{30};   // ServerAliveInterval in seconds; 0 = disabled
@@ -220,6 +257,7 @@ UiState::AppConfig load_config() {
             const auto& ssh = c["ssh"];
             cfg.ssh_host = json_get<std::string>(ssh, "host", cfg.ssh_host);
             cfg.ssh_username = json_get<std::string>(ssh, "username", cfg.ssh_username);
+            cfg.connection_mode = json_get<std::string>(ssh, "mode", cfg.connection_mode);
             cfg.ssh_command = json_get<std::string>(ssh, "command", cfg.ssh_command);
             cfg.ssh_port     = json_get<int>(ssh, "port", cfg.ssh_port);
             cfg.ssh_keepalive = json_get<int>(ssh, "keepalive", cfg.ssh_keepalive);
@@ -272,9 +310,12 @@ void save_config(const UiState& s) {
     host = host.substr(host_i);
     std::string user = s.cfg.ssh_username;
     std::string host_only = s.cfg.ssh_host;
-    split_user_host(host, user, host_only);
+    if (!host.empty()) {
+        split_user_host(host, user, host_only);
+    }
     ssh["host"] = host_only;
     ssh["username"] = user;
+    ssh["mode"] = s.cfg.connection_mode;
     ssh["command"] = s.cfg.ssh_command;
     ssh["port"] = s.cfg.ssh_port;
     ssh["keepalive"] = s.cfg.ssh_keepalive;
@@ -346,6 +387,205 @@ std::string trim(std::string s) {
     return s.substr(i);
 }
 
+std::string to_lower(std::string s) {
+    for (auto& c : s) c = static_cast<char>(g_ascii_tolower(c));
+    return s;
+}
+
+ConnectionMode parse_connection_mode(const std::string& mode) {
+    const std::string m = to_lower(trim(mode));
+    if (m == "ssh") return ConnectionMode::Ssh;
+    if (m == "local") return ConnectionMode::Local;
+    return ConnectionMode::Auto;
+}
+
+std::string shell_quote(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
+std::string first_line(const std::string& s) {
+    const auto p = s.find('\n');
+    return trim(p == std::string::npos ? s : s.substr(0, p));
+}
+
+bool host_matches_local_interface_ip(const std::string& host) {
+    if (host.empty()) return false;
+
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0 || !ifaddr) return false;
+
+    bool match = false;
+    for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        const int fam = ifa->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+
+        char buf[INET6_ADDRSTRLEN]{};
+        const void* src = nullptr;
+        if (fam == AF_INET) {
+            src = &reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr;
+        } else {
+            src = &reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr)->sin6_addr;
+        }
+        if (!inet_ntop(fam, src, buf, sizeof(buf))) continue;
+        if (host == buf) {
+            match = true;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return match;
+}
+
+bool is_local_host(const std::string& host) {
+    const std::string h = to_lower(trim(host));
+    return h.empty() ||
+           h == "localhost" ||
+           h == "127.0.0.1" ||
+           h == "::1" ||
+           host_matches_local_interface_ip(h);
+}
+
+std::string build_ssh_extra_opts(const UiState* s, int alive_count) {
+    std::string opts;
+    if (s->cfg.ssh_keepalive > 0) {
+        opts += " -o ServerAliveInterval=" + std::to_string(s->cfg.ssh_keepalive);
+        opts += " -o ServerAliveCountMax=" + std::to_string(alive_count);
+    }
+    if (s->cfg.ssh_port != 22) {
+        opts += " -p " + std::to_string(s->cfg.ssh_port);
+    }
+    return opts;
+}
+
+CommandResult run_shell_capture(const std::string& cmd) {
+    CommandResult r;
+    FILE* fp = popen(cmd.c_str(), "r");
+    if (!fp) {
+        r.output = "Failed to launch shell command.";
+        return r;
+    }
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp)) {
+        r.output += buf;
+    }
+    const int st = pclose(fp);
+    if (st == -1) {
+        r.exit_code = 127;
+    } else if (WIFEXITED(st)) {
+        r.exit_code = WEXITSTATUS(st);
+    } else {
+        r.exit_code = 128;
+    }
+    return r;
+}
+
+bool command_exists(const char* exe_name) {
+    const std::string cmd = "command -v " + shell_quote(exe_name) + " >/dev/null 2>&1";
+    const CommandResult r = run_shell_capture(cmd);
+    return r.exit_code == 0;
+}
+
+SshProbe probe_ssh_auth(const UiState* s, const std::string& host_spec, std::string* detail) {
+    std::string cmd = "ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0 -o ConnectTimeout=5";
+    cmd += build_ssh_extra_opts(s, 1);
+    cmd += " " + shell_quote(host_spec) + " true 2>&1";
+    const CommandResult r = run_shell_capture(cmd);
+    const std::string out = trim(r.output);
+    if (detail) *detail = out;
+    if (r.exit_code == 0) {
+        return SshProbe::KeyOk;
+    }
+    const std::string low = to_lower(out);
+    if (low.find("permission denied") != std::string::npos ||
+        low.find("publickey") != std::string::npos ||
+        low.find("keyboard-interactive") != std::string::npos ||
+        low.find("password:") != std::string::npos ||
+        low.find("authentication failed") != std::string::npos) {
+        return SshProbe::AuthRequired;
+    }
+    return SshProbe::Failed;
+}
+
+LaunchPlan build_launch_plan(const UiState* s,
+                             const std::string& ssh_user,
+                             const std::string& ssh_host,
+                             const std::string& remote_cmd) {
+    LaunchPlan p;
+    const ConnectionMode mode = parse_connection_mode(s->cfg.connection_mode);
+    const bool use_local = (mode == ConnectionMode::Local) ||
+                           (mode == ConnectionMode::Auto && is_local_host(ssh_host));
+    if (use_local) {
+        p.ok = true;
+        p.uses_ssh = false;
+        p.target_key = kLocalTargetKey;
+        p.shell_cmd = remote_cmd;
+        p.status_text = "Connected (local streaming)";
+        return p;
+    }
+
+    if (trim(ssh_host).empty()) {
+        p.error_text = "Host is empty";
+        return p;
+    }
+    std::string user = trim(ssh_user);
+    if (user.empty()) user = "root";
+    const std::string host_spec = join_user_host(user, trim(ssh_host));
+
+    std::string probe_detail;
+    const SshProbe probe = probe_ssh_auth(s, host_spec, &probe_detail);
+    if (probe == SshProbe::KeyOk) {
+        p.ok = true;
+        p.uses_ssh = true;
+        p.target_key = trim(ssh_host);
+        p.status_text = "Connected (SSH key)";
+        p.shell_cmd = "ssh -o BatchMode=yes";
+        p.shell_cmd += build_ssh_extra_opts(s, 3);
+        p.shell_cmd += " " + shell_quote(host_spec);
+        p.shell_cmd += " " + shell_quote(remote_cmd);
+        return p;
+    }
+
+    if (probe == SshProbe::AuthRequired) {
+        if (s->cfg.ssh_password.empty()) {
+            p.error_text = "SSH password required. Set it in Settings (Connection tab).";
+            return p;
+        }
+        if (!command_exists("sshpass")) {
+            p.error_text = "Password auth needs sshpass (not found in PATH).";
+            return p;
+        }
+
+        p.ok = true;
+        p.uses_ssh = true;
+        p.target_key = trim(ssh_host);
+        p.status_text = "Connected (SSH password)";
+        p.shell_cmd = "SSHPASS=" + shell_quote(s->cfg.ssh_password) + " sshpass -e ssh";
+        p.shell_cmd += " -o PreferredAuthentications=password,keyboard-interactive";
+        p.shell_cmd += " -o PubkeyAuthentication=no";
+        p.shell_cmd += build_ssh_extra_opts(s, 3);
+        p.shell_cmd += " " + shell_quote(host_spec);
+        p.shell_cmd += " " + shell_quote(remote_cmd);
+        return p;
+    }
+
+    const std::string one = first_line(probe_detail);
+    p.error_text = one.empty() ? "SSH preflight failed." : "SSH preflight failed: " + one;
+    return p;
+}
+
 std::string service_bg_hex(const std::string& service) {
     if (service.empty()) return "#ffffff";
 
@@ -357,11 +597,11 @@ std::string service_bg_hex(const std::string& service) {
     }
 
     // Keep colors light/pastel; use more hash bits for better per-service spread.
-    const int r = 210 + static_cast<int>((h >>  0) & 0xff);
+    const int r = 210 + static_cast<int>((h >>  0) & 0x1f);
     const int g = 210 + static_cast<int>((h >>  8) & 0x1f);
     const int b = 210 + static_cast<int>((h >> 16) & 0x1f);
 
-    char buf[8];  // "#rrggbb\0" = 8 bytes
+    char buf[9];  // "#rrggbb\0" = 8 bytes (+1 spare for fortify)
     std::sprintf(buf, "#%02x%02x%02x", r, g, b);
     return std::string(buf);
 }
@@ -450,6 +690,17 @@ void refresh_service_checkboxes(UiState* s) {
 
 void set_status(UiState* s, const char* msg) {
     gtk_label_set_text(GTK_LABEL(s->status_label), msg);
+}
+
+void set_streaming_ui_state(UiState* s, bool streaming) {
+    if (!s) return;
+    const bool busy = s->svc_check_running.load();
+    if (s->connect_btn) gtk_widget_set_sensitive(s->connect_btn, busy ? FALSE : TRUE);
+    if (s->host_entry) gtk_widget_set_sensitive(s->host_entry, (!streaming && !busy) ? TRUE : FALSE);
+    if (s->settings_btn) gtk_widget_set_sensitive(s->settings_btn, (!streaming && !busy) ? TRUE : FALSE);
+    if (s->check_svc_btn) {
+        gtk_widget_set_sensitive(s->check_svc_btn, (!streaming && !busy) ? TRUE : FALSE);
+    }
 }
 
 void update_count(UiState* s) {
@@ -851,7 +1102,7 @@ void on_timestamp_header_clicked(GtkTreeViewColumn* column, gpointer data) {
     rebuild_store(s);
 }
 
-bool start_reader_process(UiState* s, const std::string& host, const std::string& remote_cmd) {
+bool start_reader_process(UiState* s, const std::string& shell_cmd) {
     int pipefd[2];
     if (pipe(pipefd) != 0) return false;
 
@@ -863,29 +1114,51 @@ bool start_reader_process(UiState* s, const std::string& host, const std::string
     }
 
     if (pid == 0) {
+        // Isolate reader command in its own process group so disconnect can
+        // terminate the entire shell/pipeline tree.
+        setpgid(0, 0);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
 
-        // Build SSH command with configured keepalive and port.
-        std::string ssh_opts = "ssh -o BatchMode=yes";
-        if (s->cfg.ssh_keepalive > 0) {
-            ssh_opts += " -o ServerAliveInterval=" + std::to_string(s->cfg.ssh_keepalive);
-            ssh_opts += " -o ServerAliveCountMax=3";
-        }
-        if (s->cfg.ssh_port != 22) {
-            ssh_opts += " -p " + std::to_string(s->cfg.ssh_port);
-        }
-        std::string shell_cmd = ssh_opts + " " + host + " \"" + remote_cmd + "\"";
         execl("/bin/sh", "sh", "-c", shell_cmd.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
 
     close(pipefd[1]);
+    // Best-effort: ensure child is process-group leader for group signaling.
+    setpgid(pid, pid);
     s->child_pid = pid;
     s->child_fd = pipefd[0];
     return true;
+}
+
+void terminate_child_process(UiState* s, bool wait_for_exit) {
+    if (!s || s->child_pid <= 0) return;
+
+    auto signal_child = [&](int sig) {
+        if (kill(-s->child_pid, sig) != 0) {
+            kill(s->child_pid, sig);
+        }
+    };
+
+    signal_child(SIGTERM);
+    if (!wait_for_exit) return;
+
+    int status = 0;
+    for (int i = 0; i < 20; ++i) {
+        const pid_t r = waitpid(s->child_pid, &status, WNOHANG);
+        if (r == s->child_pid || r == -1) {
+            s->child_pid = -1;
+            return;
+        }
+        usleep(50 * 1000);
+    }
+
+    signal_child(SIGKILL);
+    waitpid(s->child_pid, &status, 0);
+    s->child_pid = -1;
 }
 
 void stop_reader(UiState* s) {
@@ -896,24 +1169,18 @@ void stop_reader(UiState* s) {
         s->reconnect_timer_id = 0;
     }
 
-    if (s->child_pid > 0) {
-        kill(s->child_pid, SIGTERM);
-    }
-
-    if (s->reader_thread.joinable()) {
-        s->reader_thread.join();
-    }
+    terminate_child_process(s, false);
 
     if (s->child_fd >= 0) {
         close(s->child_fd);
         s->child_fd = -1;
     }
 
-    if (s->child_pid > 0) {
-        int status = 0;
-        waitpid(s->child_pid, &status, 0);
-        s->child_pid = -1;
+    if (s->reader_thread.joinable()) {
+        s->reader_thread.join();
     }
+
+    terminate_child_process(s, true);
 }
 
 void try_reconnect(UiState* s);
@@ -922,7 +1189,7 @@ void reader_loop(UiState* s) {
     FILE* fp = fdopen(s->child_fd, "r");
     if (!fp) {
         s->child_fd = -1;
-        if (s->cfg.ssh_auto_reconnect && s->running.load()) {
+        if (s->auto_reconnect_runtime.load() && s->running.load()) {
             g_idle_add([](gpointer d) -> gboolean {
                 auto* st = static_cast<UiState*>(d);
                 set_status(st, "Connection lost — reconnecting...");
@@ -935,6 +1202,8 @@ void reader_loop(UiState* s) {
                 G_PRIORITY_DEFAULT, 5000,
                 [](gpointer d) -> gboolean {
                     auto* a = static_cast<ReconArg*>(d);
+                    a->s->reconnect_timer_id = 0;
+                    if (a->s->shutting_down.load()) return G_SOURCE_REMOVE;
                     try_reconnect(a->s);
                     return G_SOURCE_REMOVE;
                 },
@@ -946,6 +1215,7 @@ void reader_loop(UiState* s) {
                 auto* st = static_cast<UiState*>(d);
                 st->running = false;
                 gtk_button_set_label(GTK_BUTTON(st->connect_btn), "Connect");
+                set_streaming_ui_state(st, false);
                 set_status(st, "Disconnected");
                 return G_SOURCE_REMOVE;
             }, s);
@@ -976,7 +1246,7 @@ void reader_loop(UiState* s) {
     s->child_fd = -1;
 
     // Connection dropped — schedule reconnect on GTK thread.
-    if (s->cfg.ssh_auto_reconnect && s->running.load()) {
+    if (s->auto_reconnect_runtime.load() && s->running.load()) {
         g_idle_add([](gpointer d) -> gboolean {
             auto* st = static_cast<UiState*>(d);
             set_status(st, "Connection lost — reconnecting...");
@@ -989,6 +1259,7 @@ void reader_loop(UiState* s) {
             [](gpointer d) -> gboolean {
                 auto* a = static_cast<ReconArg*>(d);
                 a->s->reconnect_timer_id = 0;
+                if (a->s->shutting_down.load()) return G_SOURCE_REMOVE;
                 try_reconnect(a->s);
                 return G_SOURCE_REMOVE;
             },
@@ -998,9 +1269,10 @@ void reader_loop(UiState* s) {
     } else {
         g_idle_add([](gpointer d) -> gboolean {
             auto* st = static_cast<UiState*>(d);
-            if (!st->cfg.ssh_auto_reconnect) {
+            if (!st->auto_reconnect_runtime.load()) {
                 st->running = false;
                 gtk_button_set_label(GTK_BUTTON(st->connect_btn), "Connect");
+                set_streaming_ui_state(st, false);
                 set_status(st, "Disconnected");
             }
             return G_SOURCE_REMOVE;
@@ -1009,21 +1281,27 @@ void reader_loop(UiState* s) {
 }
 
 void try_reconnect(UiState* s) {
-    if (!s->running.load()) return;
+    if (s->shutting_down.load() || !s->running.load()) return;
 
     // Clean up previous child.
-    if (s->child_pid > 0) {
-        int status = 0;
-        waitpid(s->child_pid, &status, WNOHANG);
-        s->child_pid = -1;
+    terminate_child_process(s, false);
+    if (s->child_fd >= 0) {
+        close(s->child_fd);
+        s->child_fd = -1;
     }
     if (s->reader_thread.joinable()) s->reader_thread.join();
+    terminate_child_process(s, true);
 
-    std::string host = join_user_host(s->cfg.ssh_username, s->cfg.ssh_host);
     std::string cmd = s->cfg.ssh_command.empty() ? std::string(kDefaultRemoteCmd) : s->cfg.ssh_command;
+    const LaunchPlan plan = build_launch_plan(s, s->cfg.ssh_username, s->cfg.ssh_host, cmd);
 
-    if (!start_reader_process(s, host, cmd)) {
-        set_status(s, "Reconnect failed — retrying in 5s...");
+    if (!plan.ok || !start_reader_process(s, plan.shell_cmd)) {
+        if (!plan.ok && !plan.error_text.empty()) {
+            const std::string msg = "Reconnect failed: " + plan.error_text + " — retrying in 5s...";
+            set_status(s, msg.c_str());
+        } else {
+            set_status(s, "Reconnect failed — retrying in 5s...");
+        }
         struct ReconArg { UiState* s; };
         auto* arg = new ReconArg{s};
         s->reconnect_timer_id = g_timeout_add_full(
@@ -1031,6 +1309,7 @@ void try_reconnect(UiState* s) {
             [](gpointer d) -> gboolean {
                 auto* a = static_cast<ReconArg*>(d);
                 a->s->reconnect_timer_id = 0;
+                if (a->s->shutting_down.load()) return G_SOURCE_REMOVE;
                 try_reconnect(a->s);
                 return G_SOURCE_REMOVE;
             },
@@ -1041,7 +1320,13 @@ void try_reconnect(UiState* s) {
     }
 
     s->reader_thread = std::thread(reader_loop, s);
-    set_status(s, "Reconnected (streaming)");
+    std::string status = plan.status_text;
+    if (status.rfind("Connected", 0) == 0) {
+        status.replace(0, std::strlen("Connected"), "Reconnected");
+    } else {
+        status = "Reconnected";
+    }
+    set_status(s, status.c_str());
 }
 
 void on_filter_changed(GtkEditable*, gpointer data) {
@@ -1076,7 +1361,7 @@ void show_settings_dialog(UiState* s) {
     GtkWidget* nb = gtk_notebook_new();
     gtk_box_pack_start(GTK_BOX(content), nb, TRUE, TRUE, 0);
 
-    // --- SSH tab ---
+    // --- Connection tab ---
     GtkWidget* ssh_grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(ssh_grid), 6);
     gtk_grid_set_column_spacing(GTK_GRID(ssh_grid), 12);
@@ -1090,31 +1375,51 @@ void show_settings_dialog(UiState* s) {
         gtk_grid_attach(GTK_GRID(grid), widget, 1, row, 1, 1);
     };
 
+    GtkWidget* e_mode = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(e_mode), "auto", "Auto (Local/SSH)");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(e_mode), "ssh", "SSH only");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(e_mode), "local", "Local only");
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(e_mode), s->cfg.connection_mode.c_str());
+    if (!gtk_combo_box_get_active_id(GTK_COMBO_BOX(e_mode))) {
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(e_mode), "auto");
+    }
+    add_row(ssh_grid, 0, "Mode:", e_mode);
+
     GtkWidget* e_host = gtk_entry_new();
     gtk_entry_set_text(GTK_ENTRY(e_host), s->cfg.ssh_host.c_str());
-    add_row(ssh_grid, 0, "Host:", e_host);
+    add_row(ssh_grid, 1, "Host:", e_host);
 
     GtkWidget* e_user = gtk_entry_new();
     gtk_entry_set_text(GTK_ENTRY(e_user), s->cfg.ssh_username.c_str());
-    add_row(ssh_grid, 1, "Username:", e_user);
+    add_row(ssh_grid, 2, "Username:", e_user);
 
     GtkWidget* e_port = gtk_spin_button_new_with_range(1, 65535, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(e_port), s->cfg.ssh_port);
-    add_row(ssh_grid, 2, "Port:", e_port);
+    add_row(ssh_grid, 3, "Port:", e_port);
 
     GtkWidget* e_keepalive = gtk_spin_button_new_with_range(0, 300, 5);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(e_keepalive), s->cfg.ssh_keepalive);
-    add_row(ssh_grid, 3, "Keep-alive (s, 0=off):", e_keepalive);
+    add_row(ssh_grid, 4, "Keep-alive (s, 0=off):", e_keepalive);
 
     GtkWidget* chk_reconnect = gtk_check_button_new_with_label("Auto-reconnect on disconnect");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk_reconnect), s->cfg.ssh_auto_reconnect);
-    gtk_grid_attach(GTK_GRID(ssh_grid), chk_reconnect, 0, 4, 2, 1);
+    gtk_grid_attach(GTK_GRID(ssh_grid), chk_reconnect, 0, 5, 2, 1);
+
+    GtkWidget* e_pass = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(e_pass), FALSE);
+    gtk_entry_set_invisible_char(GTK_ENTRY(e_pass), 0x2022);
+    gtk_entry_set_text(GTK_ENTRY(e_pass), s->cfg.ssh_password.c_str());
+    gtk_entry_set_placeholder_text(
+        GTK_ENTRY(e_pass),
+        "Only used when key auth fails (requires sshpass); not saved to disk"
+    );
+    add_row(ssh_grid, 6, "Password:", e_pass);
 
     GtkWidget* e_cmd = gtk_entry_new();
     gtk_entry_set_text(GTK_ENTRY(e_cmd), s->cfg.ssh_command.c_str());
-    add_row(ssh_grid, 5, "Remote command:", e_cmd);
+    add_row(ssh_grid, 7, "Remote command:", e_cmd);
 
-    gtk_notebook_append_page(GTK_NOTEBOOK(nb), ssh_grid, gtk_label_new("SSH"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(nb), ssh_grid, gtk_label_new("Connection"));
 
     // --- Services tab ---
     GtkWidget* svc_outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1172,16 +1477,26 @@ void show_settings_dialog(UiState* s) {
 
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         // SSH
+        const gchar* mode_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(e_mode));
+        s->cfg.connection_mode = mode_id ? mode_id : "auto";
         s->cfg.ssh_host = gtk_entry_get_text(GTK_ENTRY(e_host));
         s->cfg.ssh_username = gtk_entry_get_text(GTK_ENTRY(e_user));
         s->cfg.ssh_port = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(e_port));
         s->cfg.ssh_keepalive = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(e_keepalive));
         s->cfg.ssh_auto_reconnect = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_reconnect));
+        if (!s->running.load()) {
+            s->auto_reconnect_runtime = s->cfg.ssh_auto_reconnect;
+        }
+        s->cfg.ssh_password = gtk_entry_get_text(GTK_ENTRY(e_pass));
         s->cfg.ssh_command = gtk_entry_get_text(GTK_ENTRY(e_cmd));
 
         // Update host entry in main bar.
-        gtk_entry_set_text(GTK_ENTRY(s->host_entry),
-            join_user_host(s->cfg.ssh_username, s->cfg.ssh_host).c_str());
+        if (parse_connection_mode(s->cfg.connection_mode) == ConnectionMode::Local) {
+            gtk_entry_set_text(GTK_ENTRY(s->host_entry), "");
+        } else {
+            gtk_entry_set_text(GTK_ENTRY(s->host_entry),
+                join_user_host(s->cfg.ssh_username, s->cfg.ssh_host).c_str());
+        }
 
         // Services.
         GtkTextIter start_it, end_it;
@@ -1238,13 +1553,16 @@ void show_settings_dialog(UiState* s) {
 
 struct SvcCheckArg {
     UiState* s;
-    GtkWidget* check_btn;
     std::string output;
 };
 
 gpointer run_service_check(gpointer data) {
     auto* arg = static_cast<SvcCheckArg*>(data);
     UiState* s = arg->s;
+    if (s->shutting_down.load()) {
+        delete arg;
+        return nullptr;
+    }
 
     // Build inner shell command: one printf per service.
     std::string inner = "for svc in";
@@ -1252,30 +1570,32 @@ gpointer run_service_check(gpointer data) {
         inner += " " + svc;
     inner += "; do printf \"%-40s %s\\n\" \"$svc\" \"$(systemctl is-active \"$svc\" 2>/dev/null)\"; done";
 
-    std::string ssh_opts = "ssh -o BatchMode=yes -o ConnectTimeout=5";
-    if (s->cfg.ssh_keepalive > 0)
-        ssh_opts += " -o ServerAliveInterval=" + std::to_string(s->cfg.ssh_keepalive)
-                  + " -o ServerAliveCountMax=1";
-    if (s->cfg.ssh_port != 22)
-        ssh_opts += " -p " + std::to_string(s->cfg.ssh_port);
-    std::string host = join_user_host(s->cfg.ssh_username, s->cfg.ssh_host);
-    std::string cmd = ssh_opts + " " + host + " '" + inner + "' 2>&1";
-
-    FILE* fp = popen(cmd.c_str(), "r");
-    if (!fp) {
-        arg->output = "Failed to launch SSH process.";
+    const LaunchPlan plan = build_launch_plan(s, s->cfg.ssh_username, s->cfg.ssh_host, inner);
+    if (!plan.ok) {
+        arg->output = plan.error_text.empty() ? "Failed to build service-check command." : plan.error_text;
     } else {
-        char buf[256];
-        while (fgets(buf, sizeof(buf), fp))
-            arg->output += buf;
-        pclose(fp);
-        if (arg->output.empty())
-            arg->output = "(no output — SSH may have failed or host unreachable)";
+        const std::string cmd = plan.shell_cmd + " 2>&1";
+        FILE* fp = popen(cmd.c_str(), "r");
+        if (!fp) {
+            arg->output = "Failed to launch service check process.";
+        } else {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), fp))
+                arg->output += buf;
+            pclose(fp);
+            if (arg->output.empty())
+                arg->output = "(no output — command may have failed or host unreachable)";
+        }
     }
 
     g_idle_add([](gpointer d) -> gboolean {
         auto* a = static_cast<SvcCheckArg*>(d);
-        gtk_widget_set_sensitive(a->check_btn, TRUE);
+        a->s->svc_check_running = false;
+        if (a->s->shutting_down.load()) {
+            delete a;
+            return G_SOURCE_REMOVE;
+        }
+        set_streaming_ui_state(a->s, a->s->running.load());
 
         GtkWidget* dlg = gtk_dialog_new_with_buttons(
             "Service Status",
@@ -1314,8 +1634,12 @@ gpointer run_service_check(gpointer data) {
 
 void on_check_services_clicked(GtkButton* btn, gpointer data) {
     auto* s = static_cast<UiState*>(data);
+    if (s->svc_check_running.exchange(true)) {
+        return;
+    }
+    set_streaming_ui_state(s, s->running.load());
     gtk_widget_set_sensitive(GTK_WIDGET(btn), FALSE);
-    auto* arg = new SvcCheckArg{s, GTK_WIDGET(btn), {}};
+    auto* arg = new SvcCheckArg{s, {}};
     GThread* t = g_thread_new("svc-check", run_service_check, arg);
     g_thread_unref(t);
 }
@@ -1433,44 +1757,58 @@ void on_connect_clicked(GtkButton*, gpointer data) {
     if (s->running.load()) {
         stop_reader(s);
         gtk_button_set_label(GTK_BUTTON(s->connect_btn), "Connect");
+        set_streaming_ui_state(s, false);
         set_status(s, "Disconnected");
         return;
     }
 
-    std::string host = gtk_entry_get_text(GTK_ENTRY(s->host_entry));
-    host = trim(host);
+    std::string host_input = trim(gtk_entry_get_text(GTK_ENTRY(s->host_entry)));
+    std::string user = trim(s->cfg.ssh_username);
+    std::string host_only = trim(s->cfg.ssh_host);
+    if (!host_input.empty()) {
+        split_user_host(host_input, user, host_only);
+    } else if (parse_connection_mode(s->cfg.connection_mode) != ConnectionMode::Ssh) {
+        host_only.clear();
+    }
 
-    if (host.empty()) {
-        set_status(s, "Host is empty");
+    std::string cmd = s->cfg.ssh_command.empty() ? std::string(kDefaultRemoteCmd) : s->cfg.ssh_command;
+    const LaunchPlan plan = build_launch_plan(s, user, host_only, cmd);
+    if (!plan.ok) {
+        set_status(s, plan.error_text.empty() ? "Failed to start reader" : plan.error_text.c_str());
+        return;
+    }
+    if (!start_reader_process(s, plan.shell_cmd)) {
+        set_status(s, "Failed to start reader process");
         return;
     }
 
-    // Parse and persist host/user into cfg so auto-reconnect uses them.
-    split_user_host(host, s->cfg.ssh_username, s->cfg.ssh_host);
+    // Persist host/user for reconnect and next launch.
+    s->cfg.ssh_username = user;
+    s->cfg.ssh_host = host_only;
+    s->auto_reconnect_runtime = s->cfg.ssh_auto_reconnect;
 
-    // Clear per-host discovered services when connecting to a different host.
-    if (!s->cfg.last_host.empty() && s->cfg.ssh_host != s->cfg.last_host) {
+    // Clear discovered services on target change (remote host or local).
+    if (!s->cfg.last_host.empty() && plan.target_key != s->cfg.last_host) {
         s->cfg.discovered_services.clear();
         refresh_service_checkboxes(s);
     }
-    s->cfg.last_host = s->cfg.ssh_host;
-
-    std::string cmd = s->cfg.ssh_command.empty() ? std::string(kDefaultRemoteCmd) : s->cfg.ssh_command;
-
-    if (!start_reader_process(s, host, cmd)) {
-        set_status(s, "Failed to start SSH reader");
-        return;
-    }
+    s->cfg.last_host = plan.target_key;
 
     s->running = true;
     s->reader_thread = std::thread(reader_loop, s);
 
     gtk_button_set_label(GTK_BUTTON(s->connect_btn), "Disconnect");
-    set_status(s, "Connected (streaming)");
+    set_streaming_ui_state(s, true);
+    if (plan.uses_ssh) {
+        gtk_entry_set_text(GTK_ENTRY(s->host_entry),
+                           join_user_host(s->cfg.ssh_username, s->cfg.ssh_host).c_str());
+    }
+    set_status(s, plan.status_text.empty() ? "Connected" : plan.status_text.c_str());
 }
 
 void on_destroy(GtkWidget*, gpointer data) {
     auto* s = static_cast<UiState*>(data);
+    s->shutting_down = true;
     save_config(*s);
     stop_reader(s);
     gtk_main_quit();
@@ -1507,6 +1845,7 @@ int main(int argc, char** argv) {
     UiState state;
     state.cfg = load_config();
     state.newest_at_bottom = state.cfg.newest_at_bottom;
+    state.auto_reconnect_runtime = state.cfg.ssh_auto_reconnect;
 
     state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(state.window), "logv — GTK Native Log Viewer");
@@ -1523,7 +1862,10 @@ int main(int argc, char** argv) {
     gtk_box_pack_start(GTK_BOX(top), host_lbl, FALSE, FALSE, 0);
 
     state.host_entry = gtk_entry_new();
-    const std::string host_text = join_user_host(state.cfg.ssh_username, state.cfg.ssh_host);
+    const std::string host_text =
+        (parse_connection_mode(state.cfg.connection_mode) == ConnectionMode::Local)
+            ? std::string()
+            : join_user_host(state.cfg.ssh_username, state.cfg.ssh_host);
     gtk_entry_set_text(GTK_ENTRY(state.host_entry), host_text.c_str());
     gtk_widget_set_size_request(state.host_entry, 280, -1);
     gtk_box_pack_start(GTK_BOX(top), state.host_entry, FALSE, FALSE, 0);
@@ -1534,8 +1876,8 @@ int main(int argc, char** argv) {
     state.clear_btn = gtk_button_new_with_label("Clear");
     gtk_box_pack_start(GTK_BOX(top), state.clear_btn, FALSE, FALSE, 0);
 
-    GtkWidget* settings_btn = gtk_button_new_with_label("Settings");
-    gtk_box_pack_start(GTK_BOX(top), settings_btn, FALSE, FALSE, 0);
+    state.settings_btn = gtk_button_new_with_label("Settings");
+    gtk_box_pack_start(GTK_BOX(top), state.settings_btn, FALSE, FALSE, 0);
 
     state.autoscroll_check = gtk_check_button_new_with_label("Auto-scroll");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(state.autoscroll_check), state.cfg.auto_scroll ? TRUE : FALSE);
@@ -1548,8 +1890,8 @@ int main(int argc, char** argv) {
     gtk_button_set_label(GTK_BUTTON(state.services_btn), "Services: All");
     gtk_box_pack_start(GTK_BOX(filter_bar), state.services_btn, FALSE, FALSE, 0);
 
-    GtkWidget* check_svc_btn = gtk_button_new_with_label("Check Active");
-    gtk_box_pack_start(GTK_BOX(filter_bar), check_svc_btn, FALSE, FALSE, 0);
+    state.check_svc_btn = gtk_button_new_with_label("Check Active");
+    gtk_box_pack_start(GTK_BOX(filter_bar), state.check_svc_btn, FALSE, FALSE, 0);
 
     state.services_popover = gtk_popover_new(state.services_btn);
     GtkWidget* services_scroll = gtk_scrolled_window_new(nullptr, nullptr);
@@ -1654,14 +1996,15 @@ int main(int argc, char** argv) {
 
     g_signal_connect(state.connect_btn, "clicked", G_CALLBACK(on_connect_clicked), &state);
     g_signal_connect(state.clear_btn, "clicked", G_CALLBACK(on_clear_clicked), &state);
-    g_signal_connect(settings_btn, "clicked", G_CALLBACK(on_settings_clicked), &state);
-    g_signal_connect(check_svc_btn, "clicked", G_CALLBACK(on_check_services_clicked), &state);
+    g_signal_connect(state.settings_btn, "clicked", G_CALLBACK(on_settings_clicked), &state);
+    g_signal_connect(state.check_svc_btn, "clicked", G_CALLBACK(on_check_services_clicked), &state);
     g_signal_connect(state.filter_entry, "changed", G_CALLBACK(on_filter_changed), &state);
     g_signal_connect(state.window, "destroy", G_CALLBACK(on_destroy), &state);
 
     g_timeout_add(100, drain_pending, &state);
 
     gtk_widget_show_all(state.window);
+    set_streaming_ui_state(&state, false);
     gtk_window_present(GTK_WINDOW(state.window));
     if (state.cfg.window_maximized) {
         gtk_window_maximize(GTK_WINDOW(state.window));
