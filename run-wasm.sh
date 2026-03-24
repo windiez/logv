@@ -85,7 +85,8 @@ fi
 
 is_local_host() {
   local h="$1"
-  local h_low="${h,,}"
+  local h_low
+  h_low="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
   if [[ -z "$h_low" || "$h_low" == "localhost" || "$h_low" == "127.0.0.1" || "$h_low" == "::1" ]]; then
     return 0
   fi
@@ -98,11 +99,36 @@ is_local_host() {
         ip -o -6 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true
       } | sort -u
     )"
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ips="$(
+      {
+        ifconfig 2>/dev/null | awk '/inet /{print $2}' || true
+        ifconfig 2>/dev/null | awk '/inet6 /{print $2}' | sed 's/%.*$//' || true
+      } | sort -u
+    )"
   elif command -v hostname >/dev/null 2>&1; then
     ips="$(hostname -i 2>/dev/null | tr ' ' '\n' || true)"
   fi
 
   [[ -n "$ips" ]] && grep -Fxq "$h_low" <<<"$ips"
+}
+
+hash_file_sha256() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$f" | awk '{print $NF}'
+  elif command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" | awk '{print $1}'
+  elif command -v md5 >/dev/null 2>&1; then
+    md5 -q "$f"
+  else
+    # Last resort: nanoseconds since epoch to force deploy.
+    date +%s%N
+  fi
 }
 
 # Determine runtime connection mode.
@@ -203,7 +229,7 @@ fi
 
 # ── Version check / deploy decision ───────────────────────────────────────────
 # Use file-content hash (not git commit) so uncommitted local edits are deployed.
-LOCAL_VER="$(sha256sum "$PROXY" | awk '{print $1}')"
+LOCAL_VER="$(hash_file_sha256 "$PROXY")"
 
 REMOTE_PROXY_EXISTS="$(target_exec "test -f '$REMOTE_PROXY' && echo yes || echo no" 2>/dev/null || true)"
 DEVICE_VER="$(target_exec "cat '$REMOTE_VER' 2>/dev/null || true" 2>/dev/null || true)"
