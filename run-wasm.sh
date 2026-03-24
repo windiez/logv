@@ -47,9 +47,6 @@ MODE="${3:-${LOGV_CONN_MODE:-auto}}"
 
 PROXY="$SCRIPT_DIR/logv-proxy.py"
 HTML="$SCRIPT_DIR/wasm/dist/logv.html"
-REMOTE_PROXY="/tmp/logv-proxy.py"
-REMOTE_VER="/tmp/logv-proxy.ver"
-REMOTE_LOG="/tmp/logv-proxy.log"
 
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   echo "[run_wasm] ERROR: invalid port '$PORT' (must be 1-65535)"
@@ -207,6 +204,18 @@ target_exec() {
     bash -lc "$cmd"
   fi
 }
+
+# Use user-scoped files in /tmp to avoid permission collisions between
+# different users (e.g. prior root-run artifacts).
+REMOTE_USER_RAW="$(target_exec "id -un 2>/dev/null || whoami 2>/dev/null || echo user" 2>/dev/null || echo user)"
+REMOTE_USER_TAG="$(printf '%s' "$REMOTE_USER_RAW" | tr -c '[:alnum:]_.-' '_' )"
+if [[ -z "$REMOTE_USER_TAG" ]]; then
+  REMOTE_USER_TAG="user"
+fi
+REMOTE_PREFIX="/tmp/logv-proxy-${REMOTE_USER_TAG}"
+REMOTE_PROXY="${REMOTE_PREFIX}.py"
+REMOTE_VER="${REMOTE_PREFIX}.ver"
+REMOTE_LOG="${REMOTE_PREFIX}.log"
 
 target_copy_proxy() {
   if [[ "$EXEC_MODE" == "ssh" ]]; then
