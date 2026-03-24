@@ -1,40 +1,75 @@
 #!/usr/bin/env bash
-# run_wasm.sh - Deploy logv-proxy, start it on the device, open the web viewer.
+# run-wasm.sh - Deploy logv-proxy, start it, open the web viewer.
 #
 # USAGE
-#   bash run_wasm.sh root@<device-ip> [port]
+#   bash run-wasm.sh <target|local> [port] [mode]
+#
+# MODES
+#   auto  (default) -> local when target is a local host/IP, else SSH
+#   ssh             -> force SSH
+#   local           -> force local execution
 #
 # EXAMPLES
-#   bash run_wasm.sh root@192.168.130.81
-#   bash run_wasm.sh root@192.168.130.81 9222
+#   bash run-wasm.sh root@192.168.130.81
+#   bash run-wasm.sh root@192.168.130.81 9222 ssh
+#   bash run-wasm.sh 192.168.1.99 9222 auto
+#   bash run-wasm.sh local 9222 local
+#
+# NOTES
+# - For SSH password auth, install sshpass and export LOGV_SSH_PASSWORD,
+#   or the script will prompt interactively.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ── Arguments ──────────────────────────────────────────────────────────────────
-if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+usage() {
   echo ""
-  echo "  USAGE: bash run_wasm.sh root@<device-ip> [port]"
+  echo "  USAGE: bash run-wasm.sh <target|local> [port] [mode]"
+  echo ""
+  echo "  MODES: auto (default), ssh, local"
   echo ""
   echo "  EXAMPLES:"
-  echo "    bash run_wasm.sh root@192.168.130.81"
-  echo "    bash run_wasm.sh root@192.168.130.81 9222"
+  echo "    bash run-wasm.sh root@192.168.130.81"
+  echo "    bash run-wasm.sh 192.168.1.99 9222 auto"
+  echo "    bash run-wasm.sh local 9222 local"
   echo ""
+}
+
+# ── Arguments ──────────────────────────────────────────────────────────────────
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
   exit 1
 fi
 
-TARGET="$1"
+TARGET_RAW="$1"
 PORT="${2:-9222}"
+MODE="${3:-${LOGV_CONN_MODE:-auto}}"
+
 PROXY="$SCRIPT_DIR/logv-proxy.py"
 HTML="$SCRIPT_DIR/wasm/dist/logv.html"
+REMOTE_PROXY="/tmp/logv-proxy.py"
+REMOTE_VER="/tmp/logv-proxy.ver"
+REMOTE_LOG="/tmp/logv-proxy.log"
 
-# Extract just the IP/hostname from "user@host" (handles bare "host" too)
-HOST="${TARGET##*@}"
-
-# ── Validate port ──────────────────────────────────────────────────────────────
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   echo "[run_wasm] ERROR: invalid port '$PORT' (must be 1-65535)"
   exit 1
+fi
+
+case "$MODE" in
+  auto|ssh|local) ;;
+  *)
+    echo "[run_wasm] ERROR: invalid mode '$MODE' (expected: auto|ssh|local)"
+    exit 1
+    ;;
+esac
+
+if [[ "$TARGET_RAW" == "local" ]]; then
+  TARGET=""
+  HOST="127.0.0.1"
+else
+  TARGET="$TARGET_RAW"
+  HOST="${TARGET_RAW##*@}"
 fi
 
 # ── Sanity checks ──────────────────────────────────────────────────────────────
@@ -48,56 +83,164 @@ if [[ ! -f "$HTML" ]]; then
   bash "$SCRIPT_DIR/build-wasm.sh"
 fi
 
-# ── Check SSH connectivity before doing anything ──────────────────────────────
-echo "[run_wasm] Checking SSH connection to $TARGET ..."
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$TARGET" true 2>/dev/null; then
-  echo "[run_wasm] ERROR: cannot SSH into $TARGET"
-  echo "  - Check the IP address and that the device is powered on"
-  echo "  - Make sure your SSH key is authorized: ssh-copy-id $TARGET"
+is_local_host() {
+  local h="$1"
+  local h_low="${h,,}"
+  if [[ -z "$h_low" || "$h_low" == "localhost" || "$h_low" == "127.0.0.1" || "$h_low" == "::1" ]]; then
+    return 0
+  fi
+
+  local ips=""
+  if command -v ip >/dev/null 2>&1; then
+    ips="$(
+      {
+        ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true
+        ip -o -6 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true
+      } | sort -u
+    )"
+  elif command -v hostname >/dev/null 2>&1; then
+    ips="$(hostname -i 2>/dev/null | tr ' ' '\n' || true)"
+  fi
+
+  [[ -n "$ips" ]] && grep -Fxq "$h_low" <<<"$ips"
+}
+
+# Determine runtime connection mode.
+if [[ "$MODE" == "local" ]]; then
+  EXEC_MODE="local"
+elif [[ "$MODE" == "ssh" ]]; then
+  EXEC_MODE="ssh"
+elif is_local_host "$HOST"; then
+  EXEC_MODE="local"
+else
+  EXEC_MODE="ssh"
+fi
+
+echo "[run_wasm] Mode: $EXEC_MODE (requested: $MODE, host: $HOST)"
+
+# In forced/local-exec mode, the viewer must target this machine.
+if [[ "$EXEC_MODE" == "local" ]] && ! is_local_host "$HOST"; then
+  echo "[run_wasm] NOTE: overriding viewer host '$HOST' -> 127.0.0.1 for local mode"
+  HOST="127.0.0.1"
+fi
+
+SSH_CMD=()
+SCP_CMD=()
+if [[ "$EXEC_MODE" == "ssh" ]]; then
+  if [[ -z "$TARGET" ]]; then
+    echo "[run_wasm] ERROR: SSH mode requires a target like user@host"
+    exit 1
+  fi
+
+  echo "[run_wasm] Probing SSH auth for $TARGET ..."
+  set +e
+  SSH_PROBE_OUT="$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o NumberOfPasswordPrompts=0 "$TARGET" true 2>&1)"
+  SSH_PROBE_RC=$?
+  set -e
+
+  if [[ "$SSH_PROBE_RC" -eq 0 ]]; then
+    SSH_CMD=(ssh -o BatchMode=yes)
+    SCP_CMD=(scp)
+    echo "[run_wasm] SSH auth: key/cert"
+  else
+    SSH_PROBE_LOW="$(printf '%s' "$SSH_PROBE_OUT" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$SSH_PROBE_LOW" == *"permission denied"* ||
+          "$SSH_PROBE_LOW" == *"publickey"* ||
+          "$SSH_PROBE_LOW" == *"keyboard-interactive"* ||
+          "$SSH_PROBE_LOW" == *"password"* ||
+          "$SSH_PROBE_LOW" == *"authentication failed"* ]]; then
+      if ! command -v sshpass >/dev/null 2>&1; then
+        echo "[run_wasm] ERROR: SSH password auth needed but 'sshpass' is not installed."
+        exit 1
+      fi
+      if [[ -z "${LOGV_SSH_PASSWORD:-}" ]]; then
+        read -r -s -p "[run_wasm] SSH password for $TARGET: " LOGV_SSH_PASSWORD
+        echo ""
+      fi
+      export SSHPASS="${LOGV_SSH_PASSWORD}"
+      SSH_CMD=(sshpass -e ssh -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no)
+      SCP_CMD=(sshpass -e scp -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no)
+      if ! "${SSH_CMD[@]}" -o ConnectTimeout=5 "$TARGET" true 2>/dev/null; then
+        echo "[run_wasm] ERROR: SSH password auth failed for $TARGET"
+        exit 1
+      fi
+      echo "[run_wasm] SSH auth: password"
+    else
+      echo "[run_wasm] ERROR: cannot SSH into $TARGET"
+      echo "  ${SSH_PROBE_OUT%%$'\n'*}"
+      exit 1
+    fi
+  fi
+fi
+
+target_exec() {
+  local cmd="$1"
+  if [[ "$EXEC_MODE" == "ssh" ]]; then
+    "${SSH_CMD[@]}" -o ConnectTimeout=5 "$TARGET" "$cmd"
+  else
+    bash -lc "$cmd"
+  fi
+}
+
+target_copy_proxy() {
+  if [[ "$EXEC_MODE" == "ssh" ]]; then
+    "${SCP_CMD[@]}" -q "$PROXY" "$TARGET":"$REMOTE_PROXY"
+  else
+    cp "$PROXY" "$REMOTE_PROXY"
+  fi
+}
+
+# ── Check runtime prerequisites ────────────────────────────────────────────────
+if ! target_exec "command -v nc >/dev/null 2>&1" 2>/dev/null; then
+  if [[ "$EXEC_MODE" == "ssh" ]]; then
+    echo "[run_wasm] ERROR: 'nc' not found on $TARGET"
+  else
+    echo "[run_wasm] ERROR: 'nc' not found on local machine"
+  fi
+  echo "  - Install BusyBox extras or a netcat package"
   exit 1
 fi
 
-# ── Version check: skip deploy if device already has the current proxy ─────────
-# Version = last git commit hash that touched logv-proxy.py.
-# Stored on device as ~/logv-proxy.ver   (one line, the hash).
-LOCAL_VER="$(git -C "$SCRIPT_DIR" log -1 --format=%H -- logv-proxy.py 2>/dev/null || true)"
-if [[ -z "$LOCAL_VER" ]]; then
-  # Not in a git repo or file never committed — fall back to md5 of the file
-  LOCAL_VER="$(md5sum "$PROXY" | cut -d' ' -f1)"
-fi
+# ── Version check / deploy decision ───────────────────────────────────────────
+# Use file-content hash (not git commit) so uncommitted local edits are deployed.
+LOCAL_VER="$(sha256sum "$PROXY" | awk '{print $1}')"
 
-DEVICE_VER="$(ssh "$TARGET" "cat ~/logv-proxy.ver 2>/dev/null || true" 2>/dev/null || true)"
+REMOTE_PROXY_EXISTS="$(target_exec "test -f '$REMOTE_PROXY' && echo yes || echo no" 2>/dev/null || true)"
+DEVICE_VER="$(target_exec "cat '$REMOTE_VER' 2>/dev/null || true" 2>/dev/null || true)"
+PROXY_RUNNING="$(target_exec "ps aux 2>/dev/null | grep '[l]ogv-proxy\\|nc.*-lk.*-p.*$PORT' | head -1" 2>/dev/null || true)"
 
-PROXY_RUNNING="$(ssh "$TARGET" \
-  "ps aux 2>/dev/null | grep '[l]ogv-proxy\|nc.*-lk.*-p.*$PORT' | head -1" 2>/dev/null || true)"
-
-if [[ "$LOCAL_VER" == "$DEVICE_VER" && -n "$PROXY_RUNNING" ]]; then
+if [[ "$REMOTE_PROXY_EXISTS" != "yes" ]]; then
+  echo "[run_wasm] Proxy missing on target (/tmp may have been cleared) -- deploying."
+  SKIP_DEPLOY=0
+elif [[ "$LOCAL_VER" == "$DEVICE_VER" && -n "$PROXY_RUNNING" ]]; then
   echo "[run_wasm] Proxy up-to-date and running (${LOCAL_VER:0:8}) -- reusing."
   SKIP_DEPLOY=1
 elif [[ "$LOCAL_VER" == "$DEVICE_VER" && -z "$PROXY_RUNNING" ]]; then
   echo "[run_wasm] Proxy up-to-date (${LOCAL_VER:0:8}) but not running -- will start it."
   SKIP_DEPLOY=1
 else
-  echo "[run_wasm] New version (${LOCAL_VER:0:8} vs device ${DEVICE_VER:0:8}) -- deploying."
+  echo "[run_wasm] New version (${LOCAL_VER:0:8} vs target ${DEVICE_VER:0:8}) -- deploying."
   SKIP_DEPLOY=0
 fi
 
-# ── Deploy proxy (only if needed) ─────────────────────────────────────────────
 if [[ "$SKIP_DEPLOY" -eq 0 ]]; then
-  echo "[run_wasm] Copying logv-proxy.py -> $TARGET:~/ ..."
-  if ! scp -q "$PROXY" "$TARGET":~/logv-proxy.py; then
-    echo "[run_wasm] ERROR: scp failed"
+  if [[ "$EXEC_MODE" == "ssh" ]]; then
+    echo "[run_wasm] Copying logv-proxy.py -> $TARGET:$REMOTE_PROXY ..."
+  else
+    echo "[run_wasm] Copying logv-proxy.py -> $REMOTE_PROXY ..."
+  fi
+  if ! target_copy_proxy; then
+    echo "[run_wasm] ERROR: proxy copy failed"
     exit 1
   fi
-  # Write version stamp so next run can skip this step
-  ssh "$TARGET" "echo '$LOCAL_VER' > ~/logv-proxy.ver" 2>/dev/null || true
+  target_exec "echo '$LOCAL_VER' > '$REMOTE_VER'" >/dev/null 2>&1 || true
 fi
 
-# ── Kill existing proxy on device (always restart to pick up new session) ──────
+# ── Restart proxy ──────────────────────────────────────────────────────────────
 if [[ -n "$PROXY_RUNNING" ]]; then
   echo "[run_wasm] Stopping existing proxy ..."
-  ssh "$TARGET" "
-    PIDS=\$(ps aux 2>/dev/null | grep '[l]ogv-proxy\|nc.*-lk.*-p.*$PORT' | awk '{print \$1}' | sort -u)
+  target_exec "
+    PIDS=\$(ps aux 2>/dev/null | grep '[l]ogv-proxy\|nc.*-lk.*-p.*$PORT' | awk '{print \$2}' | sort -u)
     if [ -n \"\$PIDS\" ]; then
       echo \$PIDS | xargs kill -TERM 2>/dev/null || true
       sleep 0.4
@@ -106,22 +249,24 @@ if [[ -n "$PROXY_RUNNING" ]]; then
   " 2>/dev/null || true
 fi
 
-# ── Start proxy on device (background, output to /tmp/logv-proxy.log) ─────────
-echo "[run_wasm] Starting proxy on $TARGET port $PORT ..."
-# Use 'bash -c' so nohup+background works reliably with ssh -f
-ssh -f "$TARGET" "bash -c 'nohup python3 \$HOME/logv-proxy.py $PORT > /tmp/logv-proxy.log 2>&1 &'"
-sleep 1.0   # give nc time to start listening
+echo "[run_wasm] Starting proxy on $HOST port $PORT ..."
+if [[ "$EXEC_MODE" == "ssh" ]]; then
+  "${SSH_CMD[@]}" -f -o ConnectTimeout=5 "$TARGET" "bash -c 'nohup python3 $REMOTE_PROXY $PORT > $REMOTE_LOG 2>&1 &'"
+else
+  bash -c "nohup python3 '$REMOTE_PROXY' '$PORT' > '$REMOTE_LOG' 2>&1 &"
+fi
+sleep 1.0
 
-# Confirm proxy is actually listening
-if ssh -o ConnectTimeout=3 "$TARGET" \
-     "grep -q 'Listening on port' /tmp/logv-proxy.log 2>/dev/null || \
-      cat /tmp/logv-proxy.log 2>/dev/null | grep -qi 'error\|fatal\|traceback'" 2>/dev/null; then
-  # Check for errors in the log
-  PROXY_ERR=$(ssh "$TARGET" "grep -i 'error\|fatal\|traceback' /tmp/logv-proxy.log 2>/dev/null | head -3" 2>/dev/null || true)
+if target_exec "grep -q 'Listening on port' '$REMOTE_LOG' 2>/dev/null || cat '$REMOTE_LOG' 2>/dev/null | grep -qi 'error\\|fatal\\|traceback'" 2>/dev/null; then
+  PROXY_ERR="$(target_exec "grep -i 'error\\|fatal\\|traceback' '$REMOTE_LOG' 2>/dev/null | head -3" 2>/dev/null || true)"
   if [[ -n "$PROXY_ERR" ]]; then
     echo "[run_wasm] WARNING: proxy may have errors:"
     echo "$PROXY_ERR"
-    echo "  Full log: ssh $TARGET 'cat /tmp/logv-proxy.log'"
+    if [[ "$EXEC_MODE" == "ssh" ]]; then
+      echo "  Full log: ssh $TARGET 'cat $REMOTE_LOG'"
+    else
+      echo "  Full log: cat $REMOTE_LOG"
+    fi
   fi
 fi
 
@@ -129,16 +274,9 @@ fi
 FILE_URL="file://${HTML}?host=${HOST}&port=${PORT}"
 echo "[run_wasm] Opening viewer ..."
 
-# Detect runtime environment and open in the appropriate browser.
 HTTP_PIDFILE="/tmp/logv-wasm-http.pid"
 
-# Detect runtime environment and open in the appropriate browser.
 if grep -qi microsoft /proc/version 2>/dev/null; then
-  # WSL: file:// with query strings is unreliable across Windows browsers.
-  # Start a temporary Python HTTP server in WSL -- WSL2 auto-forwards localhost
-  # to the Windows host, so the browser opens a clean http:// URL instead.
-
-  # Kill any HTTP server left over from a previous run of this script
   if [[ -f "$HTTP_PIDFILE" ]]; then
     OLD_PID="$(cat "$HTTP_PIDFILE" 2>/dev/null || true)"
     if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
@@ -148,17 +286,14 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     rm -f "$HTTP_PIDFILE"
   fi
 
-  # Find a free port for the local HTTP server
   HTTP_PORT=$((8750 + RANDOM % 200))
   SERVE_DIR="$(dirname "$HTML")"
   HTML_NAME="$(basename "$HTML")"
 
-  python3 -m http.server "$HTTP_PORT" --directory "$SERVE_DIR" --bind 127.0.0.1 \
-    >/dev/null 2>&1 &
+  python3 -m http.server "$HTTP_PORT" --directory "$SERVE_DIR" --bind 127.0.0.1 >/dev/null 2>&1 &
   HTTP_PID=$!
   echo "$HTTP_PID" > "$HTTP_PIDFILE"
 
-  # Verify the HTTP server started
   sleep 0.4
   if ! kill -0 "$HTTP_PID" 2>/dev/null; then
     echo "[run_wasm] WARNING: HTTP server failed to start. Open manually: $HTML"
@@ -169,18 +304,20 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     powershell.exe -NoProfile -Command "Start-Process '$HTTP_URL'" 2>/dev/null || \
       cmd.exe /c start "" "$HTTP_URL" 2>/dev/null || \
       echo "[run_wasm] Could not open browser. Open manually: $HTTP_URL"
-    # Kill HTTP server after 60 s (enough time for browser to fully load the file)
     (sleep 60 && kill "$HTTP_PID" 2>/dev/null && rm -f "$HTTP_PIDFILE") &
   fi
-
 elif command -v xdg-open &>/dev/null && xdg-open "$FILE_URL" 2>/dev/null; then
-  :  # native Linux with desktop environment
+  :
 elif command -v open &>/dev/null; then
-  open "$FILE_URL"  # macOS
+  open "$FILE_URL"
 else
   for B in google-chrome google-chrome-stable chromium chromium-browser firefox; do
     if command -v "$B" &>/dev/null; then "$B" "$FILE_URL" & break; fi
   done || echo "[run_wasm] Could not open browser. Open manually: $HTML"
 fi
 
-echo "[run_wasm] Done.  Proxy log: ssh $TARGET 'tail -f /tmp/logv-proxy.log'"
+if [[ "$EXEC_MODE" == "ssh" ]]; then
+  echo "[run_wasm] Done.  Proxy log: ssh $TARGET 'tail -f $REMOTE_LOG'"
+else
+  echo "[run_wasm] Done.  Proxy log: tail -f $REMOTE_LOG"
+fi

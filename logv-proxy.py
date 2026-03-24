@@ -135,6 +135,26 @@ class _Conn:
         pass  # nc owns the fd; it closes on process exit
 
 
+class _SockConn:
+    def __init__(self, sock):
+        self.sock = sock
+
+    def recv(self, n):
+        try:
+            return self.sock.recv(n)
+        except OSError:
+            return b""
+
+    def sendall(self, data):
+        self.sock.sendall(data)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Logging -- always to stderr so it never corrupts the WebSocket stream.
 # ---------------------------------------------------------------------------
@@ -218,10 +238,11 @@ def _ws_recv(conn):
 # Client handler (runs in the nc -e child process)
 # ---------------------------------------------------------------------------
 
-def _handle_client():
+def _handle_client(conn=None):
+    if conn is None:
+        conn = _Conn()
     _log("[logv-proxy] Connected")
     try:
-        conn = _Conn()
         if not _ws_handshake(conn):
             return
 
@@ -266,6 +287,7 @@ def _handle_client():
     except Exception as ex:
         _log("[logv-proxy] Error:", ex)
     finally:
+        conn.close()
         _log("[logv-proxy] Disconnected")
 
 
@@ -280,6 +302,60 @@ def _is_socket(fd):
         return _s.S_ISSOCK(os.fstat(fd).st_mode)
     except (ImportError, OSError):
         return False
+
+
+def _nc_supports_exec():
+    """
+    True when `nc` supports executing a program per connection (`-e` or --exec).
+    BusyBox nc usually has `-e`; OpenBSD nc usually does not.
+    """
+    try:
+        p = subprocess.run(
+            ["nc", "-h"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        out = p.stdout or ""
+    except OSError:
+        return False
+    low = out.lower()
+    return (" -e " in (" " + low.replace("\n", " ") + " ")) or ("\n-e" in low) or ("--exec" in low)
+
+
+def _serve_with_python_socket():
+    """
+    Fallback server for hosts where nc exists but does not support -e.
+    Uses Python's socket module when available.
+    """
+    try:
+        import socket
+    except ImportError:
+        sys.exit(
+            "[logv-proxy] FATAL: nc lacks -e and Python 'socket' is unavailable.\n"
+            "Install BusyBox nc with -e support (or a Python build with socket)."
+        )
+
+    _free_port(PORT)
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("", PORT))
+        srv.listen(16)
+    except OSError as ex:
+        sys.exit("[logv-proxy] FATAL: cannot open/listen on port {}: {}".format(PORT, ex))
+    print("[logv-proxy] Listening on port {} (python socket fallback)".format(PORT), flush=True)
+    print("[logv-proxy] Open logv.html, enter this device's IP, click Connect", flush=True)
+
+    while True:
+        try:
+            sock, _addr = srv.accept()
+        except OSError:
+            continue
+        conn = _SockConn(sock)
+        t = threading.Thread(target=_handle_client, args=(conn,), daemon=True)
+        t.start()
 
 
 def _free_port(port):
@@ -329,20 +405,24 @@ def main():
         _handle_client()
         return
 
-    # Server mode: hand over to nc, which will re-exec this script per connection.
-    # nc -lk  = persistent listener  (-k keeps nc alive after each connection)
-    # nc -e   = exec this script for each connection (stdin/stdout = socket)
-    _free_port(PORT)   # kill any previous instance still holding the port
-    script = os.path.abspath(sys.argv[0])
-    print("[logv-proxy] Listening on port {} (nc -lk)".format(PORT), flush=True)
-    print("[logv-proxy] Open logv.html, enter this device's IP, click Connect", flush=True)
-    try:
-        os.execvp("nc", ["nc", "-lk", "-p", str(PORT), "-e", "python3", script])
-    except FileNotFoundError:
-        sys.exit(
-            "[logv-proxy] FATAL: 'nc' not found.\n"
-            "Install with: opkg install busybox-extras  (or netcat-openbsd)"
-        )
+    # Server mode:
+    # 1) Prefer nc -lk -e (works on many embedded BusyBox systems).
+    # 2) Fallback to a pure-Python socket listener when nc lacks -e.
+    if _nc_supports_exec():
+        _free_port(PORT)   # kill any previous instance still holding the port
+        script = os.path.abspath(sys.argv[0])
+        print("[logv-proxy] Listening on port {} (nc -lk)".format(PORT), flush=True)
+        print("[logv-proxy] Open logv.html, enter this device's IP, click Connect", flush=True)
+        try:
+            os.execvp("nc", ["nc", "-lk", "-p", str(PORT), "-e", "python3", script])
+        except FileNotFoundError:
+            sys.exit(
+                "[logv-proxy] FATAL: 'nc' not found.\n"
+                "Install with: opkg install busybox-extras  (or netcat-openbsd)"
+            )
+    else:
+        _log("[logv-proxy] nc has no -e; using Python socket fallback")
+        _serve_with_python_socket()
 
 
 if __name__ == "__main__":

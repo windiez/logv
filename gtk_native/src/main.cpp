@@ -82,6 +82,7 @@ struct UiState {
     GtkWidget* services_popover{};
     GtkWidget* services_box{};
     GtkWidget* filter_entry{};
+    GtkWidget* clear_exclusions_btn{};
     GtkWidget* autoscroll_check{};
     GtkWidget* status_label{};
     GtkWidget* count_label{};
@@ -104,6 +105,7 @@ struct UiState {
     int child_fd{-1};
 
     std::unordered_map<std::string, GtkWidget*> service_checks;
+    std::set<std::string> excluded_row_keys;  // service + level + message
     bool newest_at_bottom{true};
     std::atomic<bool> reconnecting{false};
     std::atomic<bool> shutting_down{false};
@@ -692,6 +694,19 @@ void set_status(UiState* s, const char* msg) {
     gtk_label_set_text(GTK_LABEL(s->status_label), msg);
 }
 
+void update_exclusions_button(UiState* s) {
+    if (!s || !s->clear_exclusions_btn) return;
+    const size_t n = s->excluded_row_keys.size();
+    if (n == 0) {
+        gtk_widget_hide(s->clear_exclusions_btn);
+        return;
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "Clear exclusions (%zu)", n);
+    gtk_button_set_label(GTK_BUTTON(s->clear_exclusions_btn), buf);
+    gtk_widget_show(s->clear_exclusions_btn);
+}
+
 void set_streaming_ui_state(UiState* s, bool streaming) {
     if (!s) return;
     const bool busy = s->svc_check_running.load();
@@ -723,6 +738,18 @@ bool row_matches(const logvcore::LogEntry& e, const std::string& filter, const s
     std::string low_hay = hay;
     for (auto& c : low_hay) c = static_cast<char>(g_ascii_tolower(c));
     return low_hay.find(filter) != std::string::npos;
+}
+
+std::string exclusion_key(const std::string& svc, const std::string& lvl, const std::string& msg) {
+    return svc + "\x1f" + to_upper(lvl) + "\x1f" + msg;
+}
+
+std::string exclusion_key(const logvcore::LogEntry& e) {
+    return exclusion_key(e.service, e.level, e.message);
+}
+
+bool row_excluded(const UiState* s, const logvcore::LogEntry& e) {
+    return s && s->excluded_row_keys.find(exclusion_key(e)) != s->excluded_row_keys.end();
 }
 
 struct VisibleAnchor {
@@ -931,7 +958,9 @@ void rebuild_store(UiState* s) {
     rows.reserve(s->entries.size());
 
     for (const auto& e : s->entries) {
-        if (service_allowed(s, e.service) && row_matches(e, filter, s->cfg.level_filter)) {
+        if (!row_excluded(s, e) &&
+            service_allowed(s, e.service) &&
+            row_matches(e, filter, s->cfg.level_filter)) {
             rows.emplace_back(timestamp_order_key(e), &e);
         }
     }
@@ -1059,7 +1088,9 @@ gboolean drain_pending(gpointer data) {
 
         s->entries.push_back(e);
 
-        if (service_allowed(s, e.service) && row_matches(e, filter, s->cfg.level_filter)) {
+        if (!row_excluded(s, e) &&
+            service_allowed(s, e.service) &&
+            row_matches(e, filter, s->cfg.level_filter)) {
             insert_row_live(s, e, s->newest_at_bottom);
         }
     }
@@ -1723,6 +1754,57 @@ void copy_selected_rows(UiState* s) {
     gtk_clipboard_set_text(cb, text.c_str(), static_cast<gint>(text.size()));
 }
 
+void exclude_selected_rows(UiState* s) {
+    GtkTreeSelection* sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(s->tree_view));
+    GtkTreeModel* model = nullptr;
+    GList* rows = gtk_tree_selection_get_selected_rows(sel, &model);
+    if (!rows) return;
+
+    size_t added = 0;
+    for (GList* l = rows; l; l = l->next) {
+        GtkTreePath* path = static_cast<GtkTreePath*>(l->data);
+        GtkTreeIter iter;
+        if (!gtk_tree_model_get_iter(model, &iter, path)) continue;
+
+        gchar* svc = nullptr;
+        gchar* lvl = nullptr;
+        gchar* msg = nullptr;
+        gtk_tree_model_get(model, &iter, COL_SVC, &svc, COL_LVL, &lvl, COL_MSG, &msg, -1);
+
+        const std::string svc_s = svc ? svc : "";
+        const std::string lvl_s = lvl ? lvl : "";
+        const std::string msg_s = msg ? msg : "";
+        if (!msg_s.empty()) {
+            const auto [_, inserted] = s->excluded_row_keys.insert(exclusion_key(svc_s, lvl_s, msg_s));
+            if (inserted) ++added;
+        }
+        if (svc) g_free(svc);
+        if (lvl) g_free(lvl);
+        if (msg) g_free(msg);
+    }
+    g_list_free_full(rows, reinterpret_cast<GDestroyNotify>(gtk_tree_path_free));
+
+    if (added > 0) {
+        update_exclusions_button(s);
+        rebuild_store(s);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "Excluded %zu pattern(s)", added);
+        set_status(s, buf);
+    }
+}
+
+void clear_exclusions(UiState* s) {
+    if (s->excluded_row_keys.empty()) return;
+    s->excluded_row_keys.clear();
+    update_exclusions_button(s);
+    rebuild_store(s);
+    set_status(s, "Cleared exclusions");
+}
+
+void on_clear_exclusions_clicked(GtkButton*, gpointer data) {
+    clear_exclusions(static_cast<UiState*>(data));
+}
+
 gboolean on_tree_button_press(GtkWidget* widget, GdkEventButton* event, gpointer data) {
     auto* s = static_cast<UiState*>(data);
     if (event->type != GDK_BUTTON_PRESS || event->button != 3)
@@ -1746,6 +1828,16 @@ gboolean on_tree_button_press(GtkWidget* widget, GdkEventButton* event, gpointer
     GtkWidget* item = gtk_menu_item_new_with_label("Copy");
     g_signal_connect_swapped(item, "activate", G_CALLBACK(copy_selected_rows), s);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+
+    GtkWidget* exclude_item = gtk_menu_item_new_with_label("Exclude selected (service+level+text)");
+    g_signal_connect_swapped(exclude_item, "activate", G_CALLBACK(exclude_selected_rows), s);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), exclude_item);
+
+    GtkWidget* clear_item = gtk_menu_item_new_with_label("Clear exclusions");
+    g_signal_connect_swapped(clear_item, "activate", G_CALLBACK(clear_exclusions), s);
+    gtk_widget_set_sensitive(clear_item, s->excluded_row_keys.empty() ? FALSE : TRUE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), clear_item);
+
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), reinterpret_cast<GdkEvent*>(event));
     return TRUE;
@@ -1790,6 +1882,8 @@ void on_connect_clicked(GtkButton*, gpointer data) {
     // Clear discovered services on target change (remote host or local).
     if (!s->cfg.last_host.empty() && plan.target_key != s->cfg.last_host) {
         s->cfg.discovered_services.clear();
+        s->excluded_row_keys.clear();
+        update_exclusions_button(s);
         refresh_service_checkboxes(s);
     }
     s->cfg.last_host = plan.target_key;
@@ -1915,6 +2009,11 @@ int main(int argc, char** argv) {
     gtk_entry_set_text(GTK_ENTRY(state.filter_entry), state.cfg.last_text_filter.c_str());
     gtk_box_pack_start(GTK_BOX(filter_bar), state.filter_entry, TRUE, TRUE, 0);
 
+    state.clear_exclusions_btn = gtk_button_new_with_label("Clear exclusions");
+    gtk_widget_set_no_show_all(state.clear_exclusions_btn, TRUE);
+    gtk_widget_hide(state.clear_exclusions_btn);
+    gtk_box_pack_start(GTK_BOX(filter_bar), state.clear_exclusions_btn, FALSE, FALSE, 0);
+
     for (const auto& svc : state.cfg.services) {
         ensure_service_checkbox(&state, svc);
     }
@@ -1998,12 +2097,14 @@ int main(int argc, char** argv) {
     g_signal_connect(state.clear_btn, "clicked", G_CALLBACK(on_clear_clicked), &state);
     g_signal_connect(state.settings_btn, "clicked", G_CALLBACK(on_settings_clicked), &state);
     g_signal_connect(state.check_svc_btn, "clicked", G_CALLBACK(on_check_services_clicked), &state);
+    g_signal_connect(state.clear_exclusions_btn, "clicked", G_CALLBACK(on_clear_exclusions_clicked), &state);
     g_signal_connect(state.filter_entry, "changed", G_CALLBACK(on_filter_changed), &state);
     g_signal_connect(state.window, "destroy", G_CALLBACK(on_destroy), &state);
 
     g_timeout_add(100, drain_pending, &state);
 
     gtk_widget_show_all(state.window);
+    update_exclusions_button(&state);
     set_streaming_ui_state(&state, false);
     gtk_window_present(GTK_WINDOW(state.window));
     if (state.cfg.window_maximized) {

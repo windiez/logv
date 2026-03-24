@@ -334,7 +334,7 @@ const BUFFER = 40;
 
 let allRows      = [];
 let filteredRows = [];
-let excludedMsgs = new Set();   // exact msg strings excluded by user
+let excludedPatterns = new Set();   // key = service + level + message
 let selected     = new Set();
 let svcState     = {};    // { svcName: checked }
 let lastClick    = -1;
@@ -455,20 +455,37 @@ function copySelected() {
   });
 }
 
+function exclusionKey(r) {
+  const svc = (r?.svc || '').toLowerCase();
+  const lvl = (r?.lvl || '').toUpperCase();
+  const msg = r?.msg || '';
+  return `${svc}\x1f${lvl}\x1f${msg}`;
+}
+
+function updateExclusionUi() {
+  const btn = document.getElementById('btn-clear-excl');
+  if (excludedPatterns.size > 0) {
+    btn.style.display = 'inline-block';
+    btn.textContent = `\u2715 Clear exclusions (${excludedPatterns.size})`;
+  } else {
+    btn.style.display = 'none';
+    btn.textContent = '\u2715 Clear exclusions';
+  }
+}
+
 function excludeSelected() {
   [...selected].forEach(i => {
     const r = filteredRows[i];
-    if (r && r.msg) excludedMsgs.add(r.msg);
+    if (r && r.msg) excludedPatterns.add(exclusionKey(r));
   });
   selected.clear();
-  document.getElementById('btn-clear-excl').style.display =
-    excludedMsgs.size > 0 ? 'inline-block' : 'none';
+  updateExclusionUi();
   applyFilters();
 }
 
 function clearExclusions() {
-  excludedMsgs.clear();
-  document.getElementById('btn-clear-excl').style.display = 'none';
+  excludedPatterns.clear();
+  updateExclusionUi();
   applyFilters();
 }
 
@@ -523,15 +540,15 @@ function updateFilterIndicators() {
   const levelEl = document.getElementById('filter-level');
   levelEl.style.background = level ? '#fff3cd' : '';
   levelEl.style.fontWeight = level ? 'bold'   : '';
-  const anyActive = level || text || excludedMsgs.size > 0;
+  const anyActive = level || text || excludedPatterns.size > 0;
   document.getElementById('btn-reset-filters').style.display = anyActive ? 'inline-block' : 'none';
 }
 
 function resetAllFilters() {
   document.getElementById('filter-level').value = '';
   document.getElementById('filter-text').value  = '';
-  excludedMsgs.clear();
-  document.getElementById('btn-clear-excl').style.display = 'none';
+  excludedPatterns.clear();
+  updateExclusionUi();
   updateFilterIndicators();
   applyFilters();
 }
@@ -541,7 +558,7 @@ function applyFilters() {
   const level = document.getElementById('filter-level').value;
   const hasSvc = Object.keys(svcState).length > 0;
   filteredRows = allRows.filter(r => {
-    if (excludedMsgs.size > 0 && excludedMsgs.has(r.msg)) return false;
+    if (excludedPatterns.size > 0 && excludedPatterns.has(exclusionKey(r))) return false;
     if (hasSvc && svcState.hasOwnProperty(r.svc) && !svcState[r.svc]) return false;
     if (level && r.lvl !== level) return false;
     if (text && !(r.svc.toLowerCase().includes(text) || r.msg.toLowerCase().includes(text))) return false;
