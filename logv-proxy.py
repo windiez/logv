@@ -262,6 +262,7 @@ def _handle_client(conn=None):
         )
 
         stop = threading.Event()
+        proc_done = threading.Event()
 
         def _reader():
             for raw in proc.stdout:
@@ -270,7 +271,17 @@ def _handle_client(conn=None):
                 if not _ws_send(conn, raw.decode("utf-8", errors="replace")):
                     stop.set()
                     break
-            stop.set()
+            try:
+                rc = proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                rc = None
+            proc_done.set()
+            if not stop.is_set():
+                if rc is None:
+                    _ws_send(conn, "[logv-proxy] stream process ended")
+                else:
+                    _ws_send(conn, "[logv-proxy] stream process exited (code {})".format(rc))
+                # Keep websocket open; client can still inspect output/settings.
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
@@ -279,9 +290,12 @@ def _handle_client(conn=None):
             if _ws_recv(conn) is None:
                 stop.set()
 
-        proc.terminate()
-        try: proc.wait(timeout=3)
-        except subprocess.TimeoutExpired: proc.kill()
+        if not proc_done.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         t.join(timeout=2)
 
     except Exception as ex:
